@@ -85,7 +85,7 @@ CEI fills this gap.
 ---
 
 ## 🛠️ Usage Example
-
+```php
     require 'CEI.php';
 
     $data = [
@@ -104,9 +104,10 @@ CEI fills this gap.
 
     $result = computeCEI('metric', $data, 34.05, 8);
     print_r($result);
+```
 
 ### Sample Output
-
+```json
     {
       "cei": 82,
       "level": "Good",
@@ -117,7 +118,7 @@ CEI fills this gap.
         "pressScore": 90
       }
     }
-
+```
 ---
 
 ## 🔭 Roadmap
