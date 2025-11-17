@@ -1,168 +1,299 @@
-# 🌐 CWC Platform — CEI: Comfort Environment Index  
-A multi-dimensional, human-centric environmental comfort index  
-Created by **Caner HK**
+<p align="center">
+  <img src="./access/CWC-CEI-Logo.png" 
+       alt="CEI Logo" 
+       width="200">
+</p>
+
+<h1 align="center">CWC CEI – Comfort Environment Index</h1>
+
+<p align="center">
+  <strong>An intelligent environmental comfort scoring algorithm (0–100)</strong><br>
+  Powered by <strong>CWC Platform / Caner HK</strong>
+</p>
+
+<p align="center">
+  🌏 <a href="README-zh.md"><strong>中文文档（Chinese Documentation）</strong></a>
+</p>
 
 ---
 
-## 📌 Overview
+CEI (Comfort Environment Index) is an environmental comfort scoring algorithm that transforms raw weather and air-quality data into a unified 0–100 comfort score.  
+It is designed to push weather applications beyond simple data display and toward **intelligent environmental perception**, enabling smarter, human-centered weather insights.
 
-**CEI (Comfort Environment Index)** is an open environmental comfort scoring system under the **CWC Platform**.  
-Its goal is to transform raw meteorological and environmental sensor data into a unified **0–100 human comfort score**.
 
-Most weather applications only provide:
-- Temperature / Feels-like temperature  
-- Humidity  
-- UV index  
-- Air quality index (AQI)  
-- Wind speed  
-- Atmospheric pressure  
+## 🚀 Feature Overview (Detailed)
 
-But none can answer:
-**“How comfortable is it right now?”**
+### ✔ Climate Zone Model
+CEI begins with the principle that *comfort perception varies across different regions of the world*.  
+Using latitude, the algorithm automatically classifies each location into a major climate zone:
 
-CEI fills this gap.
+- **Tropical** – consistently warm, higher tolerance to heat  
+- **Temperate** – four distinct seasons with shifting comfort expectations  
+- **Polar** – cold-dominant regions with higher tolerance to low temperatures  
 
----
+The model also applies a **seasonal adjustment factor** based on month:
+- Summer (June–August): comfort temperature slightly increased  
+- Winter (December–February): comfort temperature slightly decreased (considering clothing and adaptation)  
 
-## 🎯 Why CEI?
-
-### Problems in current weather apps:
-- Environmental data is fragmented  
-- Comfort calculations are simplistic  
-- No climate or seasonal adaptation  
-- No unified comfort score  
-- No dynamic weighting of multi-factor influence  
-
-### CEI provides:
-- Unified comfort score (0–100)  
-- Thermal, air quality, UV, pressure fusion  
-- Climate-adaptive scoring  
-- Dynamic weight system  
-- Human-centric perception modeling  
+Each zone receives a unique **comfortTemp baseline**, ensuring CEI behaves more naturally across regions.
 
 ---
 
-## 🧠 Core Design Principles
+### ✔ Physical Thermal Perception
+Human thermal sensation is affected by more than temperature alone.  
+CEI integrates two internationally recognized thermal discomfort models:
 
-1. Multi-factor meteorological fusion  
-2. Dynamic weight adjustment  
-3. Climate region & seasonal adaptation  
-4. Scientific environmental scoring  
-5. Human comfort orientation  
+#### **Heat Index (hot discomfort)**
+Considers humidity and temperature together to estimate perceived “muggy” or “oppressive” heat.
 
----
+#### **Wind Chill (cold & wind discomfort)**
+Under low temperatures and strong wind, the perceived temperature can drop significantly.  
+CEI uses a North American/Canadian standard wind chill calculation.
 
-## 📐 Algorithm Flow (Simplified)
+#### **Automatic Model Switching**
+- If temperature ≥ 20°C → use Heat Index  
+- If temperature < 20°C → use Wind Chill  
 
-    Input → Unit normalization
-          → Dynamic weight adjustment
-          → Climate zone correction
-          → Component scoring:
-                - Thermal Comfort
-                - Air Quality
-                - UV Stress
-                - Pressure Stability
-          → Weighted Calculation
-          → Climate Adjustment
-          → CEI Output (0–100)
-          → Comfort Level Classification
+This adaptive approach ensures CEI always uses the model that best reflects real human perception.
 
 ---
 
-## 🧩 File Structure
+### ✔ Dynamic Weight Adjustment
+Environmental factors contribute differently depending on conditions.  
+The dynamic weighting system adjusts factor importance based on real-time weather:
 
-- computeCEI()  
-- dynamicWeightAdjustment()  
-- adjustForClimate()  
-- calculateThermalComfort()  
-- calculateAirQualityScoreInternational()  
-- calculateUVScore()  
-- calculatePressureScore()  
-- getCEILevel()  
+- **Temperature** → higher weight in extreme heat/cold  
+- **PM2.5** → increased importance during pollution events  
+- **UV Index** → higher weight when UVI > 8  
+- **Wind Speed** → strong winds amplify thermal discomfort, increasing heat comfort weight  
 
-(Full implementation located in CEI.php)
+The goal is to ensure the CEI remains **realistic and perception-driven**, even under extreme conditions.
 
 ---
 
-## 🛠️ Usage Example
+### ✔ Weather Condition Penalty (OpenWeather Weather ID)
+Weather conditions directly impact comfort.  
+CEI fully interprets all OpenWeather `weather id` groups and applies calibrated discomfort penalties:
+
+- **Thunderstorms (2xx)** – strong penalties (15–20) due to danger & intensity  
+- **Drizzle (3xx)** – light wet discomfort (≈6)  
+- **Rain (5xx)** – graded penalties: light (8), moderate (12), heavy/freezing rain (16–20)  
+- **Snow (6xx)** – graded by intensity: 12–20  
+- **Atmospheric phenomena (7xx)** – mist, haze, fog, dust, sand, ash, squalls (10–18)  
+- **Clear (800)** – no penalty  
+- **Clouds (801–804)** – mild penalty depending on cloud coverage (1–6)  
+
+Weather penalties adjust **thermal comfort**, reflecting real-world outdoor perception.
+
+---
+
+### ✔ International Air Quality Scoring
+CEI evaluates six major pollutants using international standards:
+
+- PM2.5  
+- PM10  
+- O₃ (ozone)  
+- CO (converted from µg/m³ → mg/m³ automatically)  
+- NO₂  
+- SO₂  
+
+Each pollutant is scored independently, and **the final air score is the minimum (worst) among them**, ensuring health relevance and avoiding false comfort under partial pollution.
+
+---
+
+### ✔ CEI Final Output (0–100)
+CEI aggregates four major comfort components:
+
+- Thermal comfort  
+- Air quality comfort  
+- UV comfort  
+- Pressure comfort  
+- + Weather condition penalty  
+- + Seasonal/climate adjustment  
+
+This produces a final 0–100 score classified into:
+
+- **Level 1 – Very comfortable**  
+- **Level 2 – Comfortable**  
+- **Level 3 – Acceptable**  
+- **Level 4 – Noticeably uncomfortable**  
+- **Level 5 – Poor comfort / avoid exposure**  
+
+A built-in safety clamp ensures CEI remains stable and never exceeds 100.
+
+---
+
+### ✔ Multi-language & Multi-platform Ready
+
+The CWC CEI algorithm is designed as a **pure, side-effect-free calculation core**, which makes it easy to re-implement in multiple programming languages **without any loss of logic or precision**.
+
+- The reference implementation is written in **PHP**.
+- The algorithm can be losslessly ported to:
+  - **JavaScript / TypeScript** (web frontends, Node.js backends)
+  - **Python** (data science pipelines, AI integration, backend services)
+  - **Java / Kotlin** (Android apps, server applications)
+  - **C / C++ / Rust / Go** (embedded devices, high-performance services)
+  - **Swift** (iOS / macOS apps)
+- The core is purely functional:
+  - No external I/O inside the CEI functions  
+  - All inputs are explicit (weather + air-quality data + context)  
+  - All outputs are deterministic (same input → same CEI result)  
+
+This design allows CEI to be:
+
+- Embedded into **mobile apps** (iOS / Android)
+- Integrated into **web frontends** and **backend APIs**
+- Deployed in **IoT / edge devices** (e.g., weather stations, e-ink displays)
+- Used in **data analysis pipelines** and **AI recommendation systems**
+
+CWC CEI is not just a PHP script, but a **portable environmental comfort model** that can be shared across your entire ecosystem.
+
+---
+
+### ✔ CEI Output
+```
+{
+  "cei": 68,
+  "level": "CEI Level 3 – Cool/Warm but acceptable",
+  "components": {
+    "heatScore": 58,
+    "airScore": 95,
+    "uvScore": 100,
+    "pressScore": 60
+  }
+}
+```
+
+---
+
+## 📦 Installation
+
+```bash
+git clone https://github.com/Caner-HK/CEI-Comfort-Environment-Index
+```
+
+Include in your PHP project:
+
 ```php
-    require 'CEI.php';
-
-    $data = [
-        'temp' => 29,
-        'humidity' => 70,
-        'wind_speed' => 2.5,
-        'pm2_5' => 12,
-        'pm10' => 35,
-        'o3' => 90,
-        'co' => 500,
-        'no2' => 22,
-        'so2' => 10,
-        'uvi' => 6,
-        'pressure' => 1008
-    ];
-
-    $result = computeCEI('metric', $data, 34.05, 8);
-    print_r($result);
+require 'cei.php';
 ```
 
-### Sample Output
-```json
-    {
-      "cei": 82,
-      "level": "Good",
-      "components": {
-        "heatScore": 78,
-        "airScore": 85,
-        "uvScore": 70,
-        "pressScore": 90
-      }
-    }
+---
+
+## 🧩 Usage Example
+
+The CEI algorithm is designed to work directly with data from the **OpenWeather One Call 3.0 API** and **Air Pollution API**.
+
+### 📡 Data Source
+
+CEI requires weather and air quality data from the following OpenWeather APIs:
+
+| API | Purpose | Documentation |
+|-----|---------|---------------|
+| **One Call API 3.0** | Provides real-time weather data including temperature, humidity, wind speed, pressure, UVI, and weather conditions. | https://openweathermap.org/api/one-call-3 |
+| **Air Pollution API** | Provides pollutant concentrations such as PM2.5, PM10, O₃, CO, NO₂, SO₂. | https://openweathermap.org/api/air-pollution |
+
+### 🔑 How to Get an API Key
+To access these APIs, sign up at:  
+https://home.openweathermap.org/users/sign_up
+
+After logging in, generate your API Key here:  
+https://home.openweathermap.org/api_keys
+
+### 📥 Required Data Input
+
+CEI uses fields from both APIs:
+
+From **One Call API 3.0** (`current`):
+- `temp`
+- `humidity`
+- `wind_speed`
+- `pressure`
+- `uvi`
+- `weather[0].id`
+
+From **Air Pollution API** (`list[0].components`):
+- `pm2_5`
+- `pm10`
+- `o3`
+- `co`
+- `no2`
+- `so2`
+
+### 🧠 How It Works
+1. Request current weather from **One Call 3.0 API**  
+2. Request pollutant data from **Air Pollution API**  
+3. Pass both datasets into `computeCEI()`  
+4. Receive a complete CEI output with component scores and comfort level
+
+Example Code:
+
+```php
+require 'CEI.php';
+
+$data = [
+    'temp'       => 6.0,
+    'humidity'   => 46,
+    'wind_speed' => 9.85,
+    'pm2_5'      => 3,
+    'pm10'       => 6,
+    'o3'         => 50,
+    'co'         => 150,
+    'no2'        => 12,
+    'so2'        => 5,
+    'uvi'        => 1.4,
+    'pressure'   => 1036,
+];
+
+$weatherId = 803; // broken clouds
+$unit = 'metric';
+$latitude = 22.3;
+$month = 1;
+
+$cei = computeCEI($unit, $data, $latitude, $month, $weatherId);
+
+print_r($cei);
 ```
----
-
-## 🔭 Roadmap
-
-### v2 — Scientific Enhancement
-- PMV/PPD comfort model (ASHRAE 55)
-- WBGT / VPD / pressure variability
-- Improved climate mapping
-
-### v3 — Machine-Learned CEI
-- Real comfort-labeled dataset  
-- Regression models  
-- Region-aware calibration  
-
-### v4 — Personalized CEI (PCEI)
-- Age / gender / sensitivity  
-- Health-aware comfort scoring  
-- Personal adaptation  
-
-### v5 — CEI Ecosystem
-- CEI forecast  
-- Integration with CWC MetAI  
-- IoT optimization  
 
 ---
 
-## 🤝 Contributing
+## 📊 Version History
 
-We welcome:
-- Issues  
-- PRs  
-- Data contributions  
-- Model improvement proposals  
+| Version | Date       | Description |
+|--------|------------|-------------|
+| v1.0.0 | 2025-11-14 | Initial release. Basic CEI with temperature, humidity, wind, simple weighting. |
+| v2.0.0 | 2025-11-17 | **Climate & Weather Enhanced Edition**: Added climate zone model, weather ID penalties, wind chill, heat index, dynamic weights, 0–100 safety mechanism, improved air-quality scoring. |
 
----
-
-## 🏷️ License
-
-Apache License 2.0  
-© Caner HK — CWC Platform
+**Current version: v2.0.0 – Climate & Weather Enhanced Edition**
 
 ---
 
-## 🧭 Contact
+## 🤝 Contribution
 
-For research, collaboration, or integration:
-**Caner HK — CWC Platform**
+We warmly welcome contributions from developers, researchers, and weather/climate enthusiasts.
+
+### How to contribute
+- **Open an Issue**  
+  Report bugs, propose new features, discuss CEI model improvements.
+- **Submit a Pull Request (PR)**  
+  - Fix bugs  
+  - Improve scoring models  
+  - Add new weather factors  
+  - Optimize documentation  
+- **Share datasets or feedback**  
+  Especially for improving comfort calibration in different climate zones.
+
+### Contribution Guidelines
+- Keep code clean and well-documented  
+- Use meaningful commit messages  
+- For larger changes, please open an issue first to discuss the design  
+- Respect existing structure unless proposing a clear improvement
+
+### Community Goal
+Building CEI into the **most advanced open-source environmental comfort model**, integrating scientific accuracy with real-world human perception.
+
+---
+
+If you like this project, please ⭐ **star the repository**
+
+
