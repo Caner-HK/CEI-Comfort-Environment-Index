@@ -229,7 +229,7 @@ From **Air Pollution API** (`list[0].components`):
 Example Code:
 
 ```php
-require 'CEI.php';
+require 'cei.php';
 
 $data = [
     'temp'       => 6.0,
