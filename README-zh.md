@@ -163,7 +163,7 @@ git clone https://github.com/Caner-HK/CEI-Comfort-Environment-Index
 PHP 项目中引用：
 
 ```php
-require 'CEI.php';
+require 'cei.php';
 ```
 
 ---
@@ -215,7 +215,7 @@ https://home.openweathermap.org/api_keys
 
 示例代码：
 ```php
-require 'CEI.php';
+require 'cei.php';
 
 $data = [
     'temp'       => 6.0,
