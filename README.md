@@ -257,6 +257,66 @@ print_r($cei);
 
 ---
 
+## 🤖 Low-Cost AI Integration – Enabling Strong Weather Reasoning in Lightweight Models
+
+Most general-purpose AI models struggle to accurately understand how weather affects human comfort.  
+They can read temperature, wind, AQI, or humidity—but they cannot combine these factors into a meaningful, human-centered interpretation.
+
+CEI solves this by acting as a **structured, climate-aware perception layer** that even small models can understand.
+
+### Why this matters for low-cost AI systems
+
+Large models (LLMs) have high inference cost and still produce inconsistent reasoning about:
+- Human thermal comfort
+- Wind-chill vs heat-index effects
+- AQI health implications
+- Climate-zone differences
+- Weather-condition discomfort
+
+By contrast, CEI provides:
+- A unified 0–100 comfort score  
+- Component-level breakdown (heat/air/UV/pressure)
+- Weather-ID discomfort mapping  
+- Climate & seasonal adjustments  
+- Deterministic and interpretable features  
+
+This allows **lightweight models with limited reasoning ability** to behave like much larger, more expensive models.
+
+### Key advantages
+
+#### ✔ **Low computation cost**
+Small models (1B–3B parameters) can understand CEI instantly—no complex reasoning required.
+
+#### ✔ **High-quality suggestions**
+Once trained with CEI, lightweight models can produce:
+- More accurate weather advice  
+- Region-aware comfort recommendations  
+- Activity/health/outdoor safety suggestions  
+- Better personalized insights  
+
+Often **equal to or better than large models**, because CEI provides strong structured signals.
+
+#### ✔ **Easy to train**
+Training requires simple supervised data:
+```
+Weather Data → CEI → Human-like Explanation
+```
+Small models quickly learn the mapping between:
+- CEI value  
+- Comfort level  
+- Practical human recommendations  
+
+#### ✔ **Commercially viable**
+Low-cost inference enables:
+- High-volume API calls  
+- Real-time mobile app usage  
+- Edge/IoT deployment  
+- Scaling to millions of users without high compute bills  
+
+CEI turns ordinary AI models into **market-ready intelligent weather advisors**, without requiring expensive cloud LLMs.
+
+**CEI enables small, affordable AI models to understand weather like humans—and offer advice like experts.**
+
 ## 📊 Version History
 
 | Version | Date       | Description |
