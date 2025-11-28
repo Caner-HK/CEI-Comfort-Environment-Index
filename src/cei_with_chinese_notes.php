@@ -1,53 +1,55 @@
 <?php
 
 /**
- * CEI v3.0.0 - Comfort Environment Index
- * --------------------------------------
- * "Risk-aware / Extreme Conditions Update"
+ * CEI v3.0.0 - 舒适环境指数（Comfort Environment Index）
+ * -------------------------------------------------------
+ * 「风险感知 / 极端条件增强版」
  *
- * This version separates:
- *   - a comfort layer (thermal, air quality, UV, pressure)
- *   - a safety/risk cap layer (extreme temperature, severe weather, official alerts)
+ * 本版本将 CEI 明确拆分为两层：
+ *   - 环境舒适层（热舒适、空气质量、紫外线、气压）
+ *   - 安全风险上限层（极端冷暖、危险天气现象、官方气象预警）
  *
- * Final CEI is:
- *   CEI = min(ComfortCEI, RiskCap)
+ * 最终 CEI 计算公式：
+ *   CEI = min(舒适度层 CEI, 安全风险上限 RiskCap)
  *
- * All scores are normalized to [0, 100].
- *
- * Input data is designed to be compatible with OpenWeather / QWeather style fields,
- * but this file itself is provider-agnostic as long as the caller prepares $data.
+ * 分数统一规范化为 [0, 100]。
+ * 输入字段兼容 OpenWeather / QWeather 风格，但本文件本身不依赖具体数据源，
+ * 只要求调用方按约定构造 $data 即可。
  */
 
 /**
- * Compute CEI for a given point in time.
+ * 计算单一时刻的 CEI 主函数。
  *
- * @param string $unit      'metric' (°C, m/s), 'imperial' (°F, mph), 'standard' (K, m/s)
- * @param array  $data      Associative array with keys (raw input):
- *                          - temp       : float, air temperature
- *                          - humidity   : float, relative humidity (%)
- *                          - wind_speed : float, wind speed
- *                          - pm2_5, pm10, o3, co, no2, so2 : float, pollutant concentrations
- *                          - uvi        : float, UV index
- *                          - pressure   : float, surface pressure (hPa)
- *                          Optional extras:
- *                          - wind_gust  : float|null, gust speed
- *                          - dew_point  : float|null, dew point temperature
- *                          - feels_like : float|null, "feels like" temperature
- *                          - weather_id : int|null, OpenWeather condition id
- *                          - alerts     : array|null, pre-normalized alert objects
- * @param float $latitude   Location latitude (for climate zone adjustments)
- * @param int   $month      1–12 (UTC month of the current time)
- * @param int|null $weatherId Optional OpenWeather weather id; if null, read from data['weather_id'] or fallback 800.
+ * @param string    $unit      单位制：
+ *                             - 'metric'   : °C, m/s
+ *                             - 'imperial' : °F, mph
+ *                             - 'standard' : K, m/s
+ * @param array     $data      输入数据（关联数组），必需字段：
+ *                             - temp       : float，气温
+ *                             - humidity   : float，相对湿度 (%)
+ *                             - wind_speed : float，风速
+ *                             - pm2_5, pm10, o3, co, no2, so2 : float，各类污染物浓度
+ *                             - uvi        : float，紫外线指数
+ *                             - pressure   : float，气压 (hPa)
+ *                             可选字段：
+ *                             - wind_gust  : float|null，阵风风速
+ *                             - dew_point  : float|null，露点温度
+ *                             - feels_like : float|null，体感温度（仅用于调试/扩展）
+ *                             - weather_id : int|null，OpenWeather 天气代码
+ *                             - alerts     : array|null，经适配层标准化后的预警数组
+ * @param float     $latitude  纬度（用于判断气候带）
+ * @param int       $month     当前月份（1–12，使用 UTC 月份）
+ * @param int|null  $weatherId 可选天气代码；为 null 时优先使用 data['weather_id']，否则回退为 800（晴）。
  *
  * @return array {
  *   cei: int 0–100,
- *   level: string,
+ *   level: string 等级描述,
  *   components: {
- *      heat: int,
- *      air: int,
- *      uv: int,
- *      pressure: int,
- *      risk: int
+ *      heat: int 热舒适得分,
+ *      air: int 空气舒适得分,
+ *      uv: int 紫外线舒适得分,
+ *      pressure: int 气压舒适得分,
+ *      risk: int 风险得分（0=无风险，100=极端风险）
  *   },
  *   weights: {
  *      heat: float,
@@ -56,28 +58,33 @@
  *      pressure: float
  *   },
  *   detail: {
- *      comfort_cei: float,
- *      risk_cap: float,
- *      main_effect: string 'heat'|'air'|'uv'|'pressure'|'risk',
- *      climate: array{zone:string,factor:float,comfortTemp:float},
+ *      comfort_cei: float 仅舒适度层的 CEI,
+ *      risk_cap: float    风险上限（100-风险分）,
+ *      main_effect: string 当前环境的主要“短板”或限制来源，
+ *                          'heat'|'air'|'uv'|'pressure'|'risk',
+ *      climate: {
+ *          zone: string 气候带名称,
+ *          factor: float 气候因子,
+ *          comfortTemp: float 基准舒适温度 (°C)
+ *      },
  *      thermal: {
- *         effective_temp: float,
- *         heat_index: float,
- *         wind_chill: float
+ *         effective_temp: float 综合体感温度,
+ *         heat_index: float 热指数,
+ *         wind_chill: float 风寒温度
  *      },
  *      risk: {
- *         overall: int,
- *         from_temp: int,
- *         from_weather: int,
- *         from_alerts: int,
- *         flags: string[]
+ *         overall: int 总风险分,
+ *         from_temp: int 来自温度极端的风险分,
+ *         from_weather: int 来自天气现象的风险分,
+ *         from_alerts: int 来自官方预警的风险分,
+ *         flags: string[] 风险标记（可用于前端展示文案）
  *      }
  *   }
  * }
  */
 function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
 {
-    // --- 1. Basic validation of unit and required fields --------------------
+    // --- 1. 基本校验：单位制与必需字段 ------------------------------
     if (!in_array($unit, ['imperial', 'metric', 'standard'], true)) {
         return ['error' => 'Invalid unit type'];
     }
@@ -94,7 +101,7 @@ function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
         }
     }
 
-    // --- 2. Extract raw inputs ---------------------------------------------
+    // --- 2. 提取原始输入值 --------------------------------------------
     $T       = (float)$data['temp'];
     $RH      = (float)$data['humidity'];
     $wind    = (float)$data['wind_speed'];
@@ -107,16 +114,16 @@ function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
     $uvi     = (float)$data['uvi'];
     $press   = (float)$data['pressure'];
 
-    // Optional extra fields
+    // 可选扩展字段
     $windGust  = (isset($data['wind_gust'])  && is_numeric($data['wind_gust']))  ? (float)$data['wind_gust']  : null;
     $dewPoint  = (isset($data['dew_point'])  && is_numeric($data['dew_point']))  ? (float)$data['dew_point']  : null;
     $feelsLike = (isset($data['feels_like']) && is_numeric($data['feels_like'])) ? (float)$data['feels_like'] : null;
 
-    // --- 3. Weather id & alerts --------------------------------------------
+    // --- 3. 天气代码与预警数组 -----------------------------------------
     if ($weatherId === null && isset($data['weather_id']) && is_numeric($data['weather_id'])) {
         $weatherId = (int)$data['weather_id'];
     }
-    // Fallback: clear sky
+    // 默认视为 800（晴）
     if ($weatherId === null) {
         $weatherId = 800;
     } else {
@@ -125,73 +132,74 @@ function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
 
     $alerts = [];
     if (isset($data['alerts']) && is_array($data['alerts'])) {
-        $alerts = $data['alerts']; // already normalized by caller
+        // 预警需由上层适配器转换成统一结构
+        $alerts = $data['alerts'];
     }
 
-    // --- 4. Unit normalization: convert to °C & m/s ------------------------
+    // --- 4. 单位统一：内部统一使用 °C 和 m/s ---------------------------
     if ($unit === 'imperial') {
-        // °F -> °C
+        // °F → °C
         $T = ($T - 32) * 5 / 9;
         if ($dewPoint !== null)  $dewPoint  = ($dewPoint  - 32) * 5 / 9;
         if ($feelsLike !== null) $feelsLike = ($feelsLike - 32) * 5 / 9;
 
-        // mph -> m/s
+        // mph → m/s
         $wind = $wind / 2.237;
         if ($windGust !== null)  $windGust  = $windGust / 2.237;
     } elseif ($unit === 'standard') {
-        // K -> °C
+        // K → °C
         $T = $T - 273.15;
         if ($dewPoint !== null)  $dewPoint  = $dewPoint - 273.15;
         if ($feelsLike !== null) $feelsLike = $feelsLike - 273.15;
-        // wind already in m/s
+        // 风速本身为 m/s，无需转换
     }
-    // metric: already in °C & m/s
+    // metric: 已经是 °C 与 m/s
 
-    // --- 5. Climate context (zone, factor, comfort temperature) ------------
+    // --- 5. 气候上下文（气候带 + 季节因子 + 舒适温度） -----------------
     $climateContext    = getClimateContext($latitude, $month);
     $climateAdjustment = $climateContext['factor'];
     $comfortTemp       = $climateContext['comfortTemp'];
 
-    // --- 6. Dynamic weights for comfort components -------------------------
+    // --- 6. 动态权重：根据情景调整热/空气/UV/气压权重 ------------------
     $weights = dynamicWeightAdjustment($T, $pm25, $uvi, $wind);
 
-    // --- 7. Thermal comfort scores -----------------------------------------
+    // --- 7. 热舒适计算 -------------------------------------------------
     $heatIndex = calculateHeatIndex($T, $RH);
     $heatScore = calculateThermalComfort($T, $RH, $wind, $heatIndex, $weatherId, $comfortTemp, $dewPoint);
 
-    // Effective temperature for detail output
+    // 记录综合体感温度详情
     $windChill     = calculateWindChill($T, max($wind, $windGust ?? $wind));
     $effectiveTemp = ($T >= 20) ? $heatIndex : $windChill;
 
-    // --- 8. Other comfort components ---------------------------------------
+    // --- 8. 其他舒适组件 ------------------------------------------------
     $airScore   = calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so2);
     $uvScore    = calculateUVScore($uvi);
     $pressScore = calculatePressureScore($press);
 
-    // Combine into comfort-only CEI
+    // 舒适层 CEI：按权重聚合
     $ceiComfort = $weights['heat']  * $heatScore
                 + $weights['air']   * $airScore
                 + $weights['uv']    * $uvScore
                 + $weights['press'] * $pressScore;
 
-    // Apply seasonal/climate factor
+    // 乘以气候因子，再做 [0,100] 限幅
     $ceiComfort *= $climateAdjustment;
     $ceiComfort  = max(0, min(100, $ceiComfort));
 
-    // --- 9. Risk layer (temperature, weather phenomena, alerts) ------------
+    // --- 9. 风险层：极端温度 / 天气现象 / 官方预警 ----------------------
     $tempRisk    = computeTemperatureRiskScore($T, $RH, $wind, $windGust, $dewPoint, $heatIndex);
     $weatherRisk = computeWeatherRiskScore($weatherId, $windGust);
     $alertsRisk  = computeAlertsRiskScore($alerts);
 
-    // Overall risk: currently max of three dimensions
+    // 当前 v3 策略：三者取最大值作为总风险
     $riskScore = max($tempRisk['score'], $weatherRisk['score'], $alertsRisk['score']);
     $riskScore = max(0, min(100, $riskScore));
 
-    // Risk cap: upper bound of CEI allowed by safety
+    // 风险上限（RiskCap）：100 - 风险分，再做 [0,100] 限幅
     $riskCap = 100 - $riskScore;
     $riskCap = max(0, min(100, $riskCap));
 
-    // --- 10. Final CEI and diagnostics -------------------------------------
+    // --- 10. 最终 CEI 与诊断信息 ---------------------------------------
     $ceiFinal = min($ceiComfort, $riskCap);
     $ceiFinal = max(0, min(100, $ceiFinal));
 
@@ -202,12 +210,13 @@ function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
         'pressure' => $pressScore
     ];
 
-    // Main driver: if riskCap is binding, main_effect = 'risk',
-    // otherwise the lowest comfort component is considered the "short board".
+    // main_effect：
+    // - 如果风险上限在“压帽”，则认为主要由风险主导
+    // - 否则认为“得分最低的舒适组件”为当前环境的“主要短板”
     $minComponent = array_keys($componentScores, min($componentScores))[0];
     $mainEffect   = ($riskCap < $ceiComfort) ? 'risk' : $minComponent;
 
-    // Merge risk flags from all sub-modules
+    // 合并各子模块的风险标记
     $detailFlags = array_values(array_unique(array_merge(
         $tempRisk['flags'],
         $weatherRisk['flags'],
@@ -258,9 +267,8 @@ function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
 }
 
 /**
- * Map CEI numeric value to a qualitative level string.
- *
- * NOTE: these boundaries are heuristic and can be calibrated in future versions.
+ * 将 CEI 数值映射为分级文案。
+ * 该分级为经验设定，后续可根据用户数据校准。
  *
  * @param float|int $cei
  * @return string
@@ -284,10 +292,10 @@ function getCEILevel($cei) {
 }
 
 /**
- * Derive climate context from latitude and month:
- *  - climate zone (equatorial / tropical / subtropical / temperate / cold_temperate / polar)
- *  - seasonal factor
- *  - baseline comfort temperature in °C
+ * 根据纬度与月份估算气候上下文信息：
+ *  - 气候带（equatorial / tropical / subtropical / temperate / cold_temperate / polar）
+ *  - 季节因子 factor
+ *  - 基础舒适温度 comfortTemp (°C)
  *
  * @param float $latitude
  * @param int   $month
@@ -316,7 +324,7 @@ function getClimateContext($latitude, $month) {
         $comfortTemp = 18;
     }
 
-    // Simple seasonal tweak: slightly warmer preference in summer, cooler in winter
+    // 简单季节微调：夏季稍微更耐热，冬季更能接受略低温度
     if (in_array($month, [6, 7, 8], true)) {
         $comfortTemp += 1;
     } elseif (in_array($month, [12, 1, 2], true)) {
@@ -333,9 +341,8 @@ function getClimateContext($latitude, $month) {
 }
 
 /**
- * Seasonal/climate factor that lightly scales the comfort CEI.
- *
- * This is intentionally simple: it should be calibrated with data in future versions.
+ * 季节/气候因子，用于对舒适度 CEI 做轻度缩放。
+ * 设计上保持简单，后续可通过数据进一步校准。
  *
  * @param float $latitude
  * @param int   $month
@@ -351,7 +358,7 @@ function adjustForClimate($latitude, $month) {
 
     $seasonFactor = 1.0;
 
-    // Northern hemisphere summer
+    // 北半球夏季
     if (in_array($month, [6, 7, 8], true)) {
         if ($climateZone === 'tropical') {
             $seasonFactor = 1.1;
@@ -359,7 +366,7 @@ function adjustForClimate($latitude, $month) {
             $seasonFactor = 0.9;
         }
     }
-    // Northern hemisphere winter
+    // 北半球冬季
     elseif (in_array($month, [12, 1, 2], true)) {
         if ($climateZone === 'tropical') {
             $seasonFactor = 0.9;
@@ -372,13 +379,9 @@ function adjustForClimate($latitude, $month) {
 }
 
 /**
- * Dynamic weights for comfort components (heat / air / UV / pressure).
- *
- * The weights are adjusted based on:
- *  - temperature (cold or hot conditions -> heat matters more)
- *  - PM2.5 (polluted -> air quality matters more)
- *  - UV (strong UV -> UV matters more)
- *  - wind (strong wind -> thermal comfort more important)
+ * 动态权重调整：
+ * 根据温度、PM2.5、紫外线、风速，对热/空气/UV/气压四类权重进行轻量调节，
+ * 再归一化为和为 1。
  *
  * @param float $T
  * @param float $pm25
@@ -394,14 +397,14 @@ function dynamicWeightAdjustment($T, $pm25, $uvi, $wind) {
         'press' => 0.1
     ];
 
-    // Cold or hot conditions: increase heat importance
+    // 冷热环境：热舒适权重升高
     if ($T > 30) {
         $weights['heat'] = 0.5;
     } elseif ($T < 15) {
         $weights['heat'] = 0.6;
     }
 
-    // Strong wind: thermal comfort becomes more critical
+    // 大风：热舒适更关键
     if ($wind > 8) {
         $weights['heat'] += 0.05;
     }
@@ -409,17 +412,17 @@ function dynamicWeightAdjustment($T, $pm25, $uvi, $wind) {
         $weights['heat'] += 0.05;
     }
 
-    // High PM2.5: air quality becomes more important
+    // 雾霾环境：空气质量权重升高
     if ($pm25 > 35) {
         $weights['air'] = 0.5;
     }
 
-    // Strong UV
+    // 强紫外线
     if ($uvi > 8) {
         $weights['uv'] = 0.2;
     }
 
-    // Floor weights and normalize to sum 1.0
+    // 设置最小权重并归一化
     $minWeight = 0.05;
     foreach ($weights as $key => $value) {
         if ($value < $minWeight) {
@@ -437,8 +440,8 @@ function dynamicWeightAdjustment($T, $pm25, $uvi, $wind) {
 }
 
 /**
- * Heat Index (Steadman-like) in °C, using T(°C) and RH(%).
- * For T < 20°C the heat index is not meaningful; returns T.
+ * 热指数 (Heat Index) 计算，单位为 °C。
+ * 当 T < 20°C 时，热指数不具有意义，直接返回 T。
  *
  * @param float $T
  * @param float $RH
@@ -471,12 +474,12 @@ function calculateHeatIndex($T, $RH) {
 }
 
 /**
- * Wind Chill calculation using the Canadian/US standard formula.
+ * 风寒温度计算，使用加拿大/美国标准公式。
  *
- * Input:
- *  - T in °C
- *  - wind in m/s
- * Only applies when T < 10°C and wind > 1.3 m/s.
+ * 输入：
+ *  - T: °C
+ *  - wind: m/s
+ * 仅在 T < 10°C 且 wind > 1.3 m/s 时生效，否则返回原始 T。
  *
  * @param float $T
  * @param float $wind
@@ -496,12 +499,8 @@ function calculateWindChill($T, $wind) {
 }
 
 /**
- * Temperature comfort curve as a function of deviation from comfort temperature.
- *
- * The curve is piecewise:
- *  - within ±2°C: full score
- *  - moderate deviations: gradually reduced
- *  - large deviations: floor at low values
+ * 温度舒适曲线：根据“综合体感温度相对于舒适温度的偏差”给出得分。
+ * 将偏差分为多个区间，近似为分段线性/平台下降。
  *
  * @param float $effectiveTemp
  * @param float $comfortTemp
@@ -526,14 +525,15 @@ function thermalComfortCurve($effectiveTemp, $comfortTemp)
 }
 
 /**
- * Thermal comfort score combining:
- *  - temperature comfort around climate-specific comfortTemp
- *  - humidity comfort (around RH=50%)
- *  - wind comfort (strong wind is uncomfortable)
- *  - extra hot discomfort from high Heat Index and high dew point
- *  - weather-based penalty (rain, snow, storms, etc.)
+ * 热舒适主函数：
+ *  综合考虑：
+ *   - 温度与气候带基准舒适温度的偏差
+ *   - 湿度偏离 50% 的程度
+ *   - 风速（大风带来的不适）
+ *   - 热指数与露点带来的闷热感
+ *   - OpenWeather weatherId 带来的天气现象不适惩罚（仅限舒适层）
  *
- * Returns 0–100.
+ * 返回 0–100 之间的热舒适得分。
  *
  * @param float      $T
  * @param float      $RH
@@ -545,7 +545,7 @@ function thermalComfortCurve($effectiveTemp, $comfortTemp)
  * @return float
  */
 function calculateThermalComfort($T, $RH, $wind, $heatIndex, $weatherId, $comfortTemp, $dewPoint = null) {
-    // Effective temperature: Heat Index in warm conditions, Wind Chill in cold conditions
+    // 综合体感温度：暖季用热指数，冷季用风寒
     if ($T >= 20) {
         $effectiveTemp = $heatIndex;
     } else {
@@ -554,36 +554,36 @@ function calculateThermalComfort($T, $RH, $wind, $heatIndex, $weatherId, $comfor
 
     $tempComfort = thermalComfortCurve($effectiveTemp, $comfortTemp);
 
-    // Humidity comfort centered near 50% RH
+    // 湿度舒适：以 50% 为中心
     $humidityComfort = 100 - min(60, abs($RH - 50) * 1.2);
 
-    // Extra penalty for hot and humid conditions (high dew point)
+    // 高露点 + 高温：额外闷热惩罚
     if ($dewPoint !== null && $T >= 20 && $dewPoint >= 24) {
         $extra = min(15, ($dewPoint - 23) * 1.5);
         $humidityComfort = max(20, $humidityComfort - $extra);
     }
 
-    // Wind comfort: calm to light wind is fine; strong wind reduces comfort
+    // 风舒适：微风最舒适，大风显著降低舒适度
     if ($wind <= 3) {
         $windComfort = 100;
     } else {
         $windComfort = max(20, 100 - ($wind - 3) * 10);
     }
 
-    // Additional hot discomfort when Heat Index is high
+    // 热指数额外惩罚：明显偏高时按斜率扣分
     if ($heatIndex <= 27) {
         $heatComfort = 100;
     } else {
         $heatComfort = max(20, 100 - ($heatIndex - 27) * 8);
     }
 
-    // Aggregate thermal comfort score
+    // 汇总热舒适得分
     $comfortScore = 0.5 * $tempComfort
                   + 0.25 * $humidityComfort
                   + 0.15 * $windComfort
                   + 0.10 * $heatComfort;
 
-    // Weather condition penalty (rain, snow, storms, fog, dust, etc.)
+    // 基于天气现象的额外不适惩罚（雨雪雷暴、雾霾等）
     $weatherPenalty = getWeatherDiscomfortPenalty($weatherId);
     $comfortScore  -= $weatherPenalty;
 
@@ -591,10 +591,8 @@ function calculateThermalComfort($T, $RH, $wind, $heatIndex, $weatherId, $comfor
 }
 
 /**
- * Weather-based discomfort penalty using OpenWeather weather id.
- *
- * Returns penalty in [0, 25], where higher means more uncomfortable.
- * This affects only the comfort layer, not the risk layer.
+ * 基于 OpenWeather weatherId 的天气现象不适惩罚（仅作用于舒适层）。
+ * 返回 [0,25] 范围的 penalty，数值越大表示越不舒适。
  *
  * @param int $weatherId
  * @return int
@@ -603,17 +601,17 @@ function getWeatherDiscomfortPenalty($weatherId) {
     $penalty = 0;
 
     if ($weatherId >= 200 && $weatherId < 300) {
-        // Thunderstorm
+        // 雷暴
         if (in_array($weatherId, [212, 221, 232], true)) {
             $penalty = 20;
         } else {
             $penalty = 15;
         }
     } elseif ($weatherId >= 300 && $weatherId < 400) {
-        // Drizzle
+        // 毛毛雨
         $penalty = 6;
     } elseif ($weatherId >= 500 && $weatherId < 600) {
-        // Rain
+        // 雨
         if (in_array($weatherId, [500, 520], true)) {
             $penalty = 8;
         } elseif (in_array($weatherId, [501, 521, 531], true)) {
@@ -626,7 +624,7 @@ function getWeatherDiscomfortPenalty($weatherId) {
             $penalty = 12;
         }
     } elseif ($weatherId >= 600 && $weatherId < 700) {
-        // Snow
+        // 雪
         if (in_array($weatherId, [600, 615, 620], true)) {
             $penalty = 12;
         } elseif (in_array($weatherId, [601, 612, 621], true)) {
@@ -635,7 +633,7 @@ function getWeatherDiscomfortPenalty($weatherId) {
             $penalty = 20;
         }
     } elseif ($weatherId >= 700 && $weatherId < 800) {
-        // Atmosphere (mist, smoke, haze, fog, dust, sand, etc.)
+        // 大气现象（雾、霾、沙尘等）
         if (in_array($weatherId, [701, 711, 721, 741], true)) {
             $penalty = 10;
         } elseif (in_array($weatherId, [731, 751, 761, 762, 771], true)) {
@@ -646,10 +644,10 @@ function getWeatherDiscomfortPenalty($weatherId) {
             $penalty = 12;
         }
     } elseif ($weatherId === 800) {
-        // Clear sky
+        // 晴
         $penalty = 0;
     } elseif ($weatherId >= 801 && $weatherId <= 804) {
-        // Clouds
+        // 多云
         if ($weatherId === 801) {
             $penalty = 1;
         } elseif ($weatherId === 802) {
@@ -665,9 +663,8 @@ function getWeatherDiscomfortPenalty($weatherId) {
 }
 
 /**
- * Air quality comfort score based on multiple pollutants.
- *
- * Returns the minimum (worst) score among all pollutants.
+ * 多污染物空气质量舒适得分。
+ * 每种污染物分别打分后取最差值作为整体空气舒适分。
  *
  * @param float $pm25
  * @param float $pm10
@@ -707,7 +704,7 @@ function calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so
         [200, 20]
     ]);
 
-    // CO: convert µg/m³ to mg/m³
+    // CO: µg/m³ → mg/m³
     $co_mg = $co / 1000.0;
     $scores['co'] = calculatePollutantScore($co_mg, [
         [1, 100],
@@ -735,15 +732,20 @@ function calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so
         [100, 20]
     ]);
 
-    // Overall air comfort is limited by the worst pollutant
+    // 取最差项作为综合空气舒适得分
     return min($scores);
 }
 
 /**
- * Generic pollutant scoring helper.
+ * 通用污染物打分函数。
+ * $thresholds 形如：
+ *   [
+ *     [上限浓度, 对应得分],
+ *     ...
+ *   ]
  *
  * @param float $concentration
- * @param array $thresholds Each item: [limit, score]
+ * @param array $thresholds
  * @return float
  */
 function calculatePollutantScore($concentration, $thresholds) {
@@ -756,7 +758,7 @@ function calculatePollutantScore($concentration, $thresholds) {
 }
 
 /**
- * UV comfort score based on UV index.
+ * 紫外线舒适得分。
  *
  * @param float $uvi
  * @return float
@@ -778,7 +780,7 @@ function calculateUVScore($uvi) {
 }
 
 /**
- * Pressure comfort score around standard sea level pressure (1013.25 hPa).
+ * 气压舒适得分，以 1013.25 hPa 为参考。
  *
  * @param float $pressure
  * @return float
@@ -793,15 +795,12 @@ function calculatePressureScore($pressure) {
     if ($deviation <= 20) return 70;
     if ($deviation <= 25) return 60;
 
-    // Beyond 25 hPa difference, decay quickly but keep a floor at 40
+    // 偏差超过 25 hPa 后快速下降，但保留 40 分下限
     return max(40, 100 - $deviation * 2);
 }
 
 /**
- * Compute risk score from temperature, humidity, wind, gusts and dew point.
- *
- * This represents potential health/survival risk in extreme cold/heat,
- * not just discomfort.
+ * 温度相关风险评分（极端冷/热），代表生命/健康层面的风险，而不是单纯不适。
  *
  * @param float      $T
  * @param float      $RH
@@ -815,7 +814,7 @@ function computeTemperatureRiskScore($T, $RH, $wind, $windGust = null, $dewPoint
 {
     $flags = [];
 
-    // Use gust if stronger than mean wind speed
+    // 有阵风时使用更大的有效风速
     $vEff  = $wind;
     if ($windGust !== null && is_numeric($windGust) && $windGust > $vEff) {
         $vEff = $windGust;
@@ -823,7 +822,7 @@ function computeTemperatureRiskScore($T, $RH, $wind, $windGust = null, $dewPoint
 
     $windChill = calculateWindChill($T, $vEff);
 
-    // Cold risk thresholds (wind chill based)
+    // 基于风寒的低温风险区间
     $coldRisk = 0;
     if ($windChill <= -45) {
         $coldRisk = 95;
@@ -842,12 +841,12 @@ function computeTemperatureRiskScore($T, $RH, $wind, $windGust = null, $dewPoint
         $flags[]  = 'temp_cold_25';
     }
 
-    // Heat risk thresholds (heat index based)
+    // 基于热指数的高温风险区间
     if ($heatIndex === null) {
         $heatIndex = calculateHeatIndex($T, $RH);
     }
 
-    // High dew point aggravates heat risk
+    // 高露点对高温风险的放大
     if ($dewPoint !== null && $dewPoint >= 26) {
         $heatIndex += ($dewPoint >= 29) ? 4 : 2;
     }
@@ -876,10 +875,8 @@ function computeTemperatureRiskScore($T, $RH, $wind, $windGust = null, $dewPoint
 }
 
 /**
- * Compute risk score from weather phenomena and strong wind gusts.
- *
- * Uses OpenWeather weather id and gust thresholds to estimate
- * potential hazard (storms, heavy rain, snow, fog, dust, tornado, etc).
+ * 基于天气现象（weatherId）及强阵风的风险评分。
+ * 用于反映暴雨/暴雪/沙尘/龙卷风等天气对应的安全风险。
  *
  * @param int        $weatherId
  * @param float|null $windGust
@@ -891,7 +888,7 @@ function computeWeatherRiskScore($weatherId, $windGust = null)
     $flags = [];
 
     if ($weatherId >= 200 && $weatherId < 300) {
-        // Thunderstorm
+        // 雷暴
         if (in_array($weatherId, [212, 221, 232], true)) {
             $score = 70;
             $flags[] = 'wx_thunderstorm_heavy';
@@ -901,12 +898,12 @@ function computeWeatherRiskScore($weatherId, $windGust = null)
         }
     }
     elseif ($weatherId >= 300 && $weatherId < 400) {
-        // Drizzle
+        // 毛毛雨
         $score = 20;
         $flags[] = 'wx_drizzle';
     }
     elseif ($weatherId >= 500 && $weatherId < 600) {
-        // Rain
+        // 雨
         if (in_array($weatherId, [500, 520], true)) {
             $score = 30;
             $flags[] = 'wx_rain_light';
@@ -922,7 +919,7 @@ function computeWeatherRiskScore($weatherId, $windGust = null)
         }
     }
     elseif ($weatherId >= 600 && $weatherId < 700) {
-        // Snow
+        // 雪
         if (in_array($weatherId, [600, 615, 620], true)) {
             $score = 40;
             $flags[] = 'wx_snow_light';
@@ -935,7 +932,7 @@ function computeWeatherRiskScore($weatherId, $windGust = null)
         }
     }
     elseif ($weatherId >= 700 && $weatherId < 800) {
-        // Atmosphere group
+        // 大气现象
         if (in_array($weatherId, [701, 711, 721, 741], true)) {
             $score = 35;
             $flags[] = 'wx_fog_mist';
@@ -948,7 +945,7 @@ function computeWeatherRiskScore($weatherId, $windGust = null)
         }
     }
 
-    // Additional risk from very strong gusts (Beaufort ~7+)
+    // 强阵风带来的额外风险（接近或超过大风、烈风级别）
     if ($windGust !== null && is_numeric($windGust)) {
         if ($windGust >= 25) {
             $score = max($score, 70);
@@ -969,16 +966,16 @@ function computeWeatherRiskScore($weatherId, $windGust = null)
 }
 
 /**
- * Compute risk score from official weather alerts.
+ * 基于官方天气预警（alerts）的风险评分。
+ * 预警需先由适配层转换为统一结构：
  *
- * Input alerts are normalized by an adapter layer and typically look like:
  *  [
- *    'event'          => string|null,
- *    'description'    => string|null,
- *    'tags'           => string[],  // contains 'hazard:*', 'severity:*', 'color:*', 'provider:*'
- *    'severity'       => string|null, // minor/moderate/severe/extreme/unknown
- *    'severity_score' => float|null,  // optional ML-based [0,1]
- *    'code'           => int|null     // provider-specific code (e.g. QWeather)
+ *    'event'          => string|null,   // 标题（可选）
+ *    'description'    => string|null,   // 描述（可选）
+ *    'tags'           => string[],      // 'hazard:*', 'severity:*', 'color:*', 'provider:*'
+ *    'severity'       => string|null,   // 'minor'|'moderate'|'severe'|'extreme'|'unknown'
+ *    'severity_score' => float|null,    // 可选，模型输出的 [0,1] 严重程度
+ *    'code'           => int|null       // 数据源内部预警代码（如 QWeather）
  *  ]
  *
  * @param array $alerts
@@ -990,7 +987,7 @@ function computeAlertsRiskScore(array $alerts)
         return ['score' => 0, 'flags' => []];
     }
 
-    // Base risk by hazard type, assuming "moderate" severity (~factor=1.0).
+    // 各类灾害的基准风险（约对应“中等等级”预警）
     $hazardBaseRisk = [
         'extreme_cold'     => 85,
         'extreme_heat'     => 80,
@@ -1028,7 +1025,7 @@ function computeAlertsRiskScore(array $alerts)
             $hazards = ['other'];
         }
 
-        // Severity factor scales base risk (blue/yellow/orange/red etc.)
+        // 严重程度因子（结合预警颜色/级别/可选模型评分）
         $sevFactor = mapSeverityToFactor($severity, $severityScore);
 
         foreach ($hazards as $h) {
@@ -1059,11 +1056,12 @@ function computeAlertsRiskScore(array $alerts)
 }
 
 /**
- * Extract hazard types from alert tags.
+ * 从 tags 数组中提取灾害类型 hazard 列表。
  *
- * Example tags:
+ * 例如：
  *   ['hazard:wind', 'hazard:flood', 'severity:severe', 'provider:qweather']
- * -> returns ['wind', 'flood']
+ * 返回：
+ *   ['wind', 'flood']
  *
  * @param array $tags
  * @return array
@@ -1088,10 +1086,11 @@ function extractHazardsFromTags(array $tags): array
 }
 
 /**
- * Map severity (and optional ML severity_score) to a numeric factor.
+ * 将预警严重程度（文本或模型分数）映射为缩放因子。
  *
- * If severity_score is provided, it must be in [0,1] and is mapped to [0.7, 1.4].
- * Otherwise we map string labels (minor/moderate/severe/extreme) to fixed factors.
+ * 逻辑：
+ *  - 若提供 severity_score ∈ [0,1]，则线性映射到 [0.7, 1.4]
+ *  - 否则根据 severity 字段 'minor'/'moderate'/'severe'/'extreme' 映射固定因子
  *
  * @param string|null $severity
  * @param float|null  $severityScore
@@ -1101,7 +1100,7 @@ function mapSeverityToFactor(?string $severity, ?float $severityScore = null): f
 {
     if ($severityScore !== null) {
         $x = max(0.0, min(1.0, $severityScore));
-        return 0.7 + 0.7 * $x; // linear interpolation between 0.7 and 1.4
+        return 0.7 + 0.7 * $x; // 0.7 ~ 1.4 线性插值
     }
 
     if ($severity === null) {
@@ -1124,7 +1123,7 @@ function mapSeverityToFactor(?string $severity, ?float $severityScore = null): f
 }
 
 /**
- * Safe lowercase helper with UTF-8 support.
+ * 安全的字符串小写转换工具，优先使用 mb_strtolower（UTF-8）。
  *
  * @param string $str
  * @return string

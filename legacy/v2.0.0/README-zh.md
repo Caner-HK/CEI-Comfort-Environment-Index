@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="./access/CWC-CEI-Logo.png" 
+  <img src="https://github.com/Caner-HK/CEI-Comfort-Environment-Index/raw/main/access/CWC-CEI-Logo.png" 
        alt="CEI Logo" 
        width="200">
 </p>
 
 <h1 align="center">CWC CEI – 环境舒适度指数 <br><span>（Comfort Environment Index）</span></h1>
-
+<h3 align="center">此版本已被取代</h3>
 <p align="center">
   <strong>一套将天气与空气质量整合为 0–100 舒适评分的智能算法</strong><br>
   由 <strong>CWC Platform / Caner HK</strong> 提供支持
