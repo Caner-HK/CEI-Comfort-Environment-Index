@@ -283,7 +283,7 @@ CWC CEI 算法在设计上保持 **纯计算核心**，不依赖特定框架或 
 git clone https://github.com/Caner-HK/CEI-Comfort-Environment-Index
 ```
 
-在 PHP 项目中引用（文件名可根据你的项目结构调整）：
+在 PHP 项目中引用：
 
 ```php
 require 'cei.php';
