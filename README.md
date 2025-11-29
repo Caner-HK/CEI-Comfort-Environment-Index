@@ -426,6 +426,9 @@ $normalizedAlerts = [
     'severity'       => 'minor',
     'severity_score' => null,
     'code'           => 1006
+
+    'start_ts'       => 1732854000, // Alert start time (Unix Timestamp)
+    'end_ts'         => 1732940400, // Alert end time (Unix Timestamp)
   ],
   // ...
 ];
@@ -517,8 +520,9 @@ Benefits:
 | v1.0.0  | 2025-11-14 | Initial release: basic CEI with temperature, humidity, wind and simple weighting.                                                                                                                                                             |
 | v2.0.0  | 2025-11-17 | Climate- & condition-aware update: added climate zone model, weather-type penalties, wind chill, heat index, dynamic weights and improved air quality scoring.                                                                                |
 | v3.0.0  | 2025-11-28 | Risk-aware / extreme conditions update: introduced a separate risk layer (temperature, hazardous weather, official alerts), RiskCap mechanism, structured risk outputs and support for `dew_point`, `wind_gust`, `alerts` and related fields. |
+| v3.1.0 | 2025-11-29 | Alerts expiration update: Add `start_ts` / `end_ts` (Unix timestamps, UTC seconds) to unify the alerts structure, support the differentiation of alerts that have not started, are in progress, and have expired in the risk score, and optimize the risk constraints in early warning scenarios. |
 
-> **Current version: v3.0.0 – Risk-aware / Extreme Conditions Edition**
+> **Current version: v3.1.0 – Alerts expiration update**
 
 ---
 

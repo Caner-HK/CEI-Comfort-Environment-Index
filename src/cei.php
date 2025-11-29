@@ -1,13 +1,16 @@
 <?php
 
 /**
- * CEI v3.0.0 - Comfort Environment Index
+ * CEI v3.1.0 - Comfort Environment Index
  * --------------------------------------
- * "Risk-aware / Extreme Conditions Update"
+ * "Alerts expiration update"
  *
  * This version separates:
  *   - a comfort layer (thermal, air quality, UV, pressure)
  *   - a safety/risk cap layer (extreme temperature, severe weather, official alerts)
+ * 
+ * Alert function update:
+ *   - Add start_ts and end_ts, support the differentiation of alerts that have not started, are in progress, and have expired in the risk score, and optimize the risk constraints in early warning scenarios.
  *
  * Final CEI is:
  *   CEI = min(ComfortCEI, RiskCap)
@@ -181,7 +184,7 @@ function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
     // --- 9. Risk layer (temperature, weather phenomena, alerts) ------------
     $tempRisk    = computeTemperatureRiskScore($T, $RH, $wind, $windGust, $dewPoint, $heatIndex);
     $weatherRisk = computeWeatherRiskScore($weatherId, $windGust);
-    $alertsRisk  = computeAlertsRiskScore($alerts);
+    $alertsRisk  = computeAlertsRiskScore($alerts); // You can pass in $nowTs here. If you don't pass in $nowTs, the current Unix time will be used.
 
     // Overall risk: currently max of three dimensions
     $riskScore = max($tempRisk['score'], $weatherRisk['score'], $alertsRisk['score']);
@@ -969,28 +972,43 @@ function computeWeatherRiskScore($weatherId, $windGust = null)
 }
 
 /**
- * Compute risk score from official weather alerts.
+ * Risk scoring based on official weather alerts.
  *
- * Input alerts are normalized by an adapter layer and typically look like:
+ * Alerts must first be normalized by an adapter layer into a unified, source-agnostic structure:
+ *
+ *  Each alert is an associative array:
  *  [
- *    'event'          => string|null,
- *    'description'    => string|null,
- *    'tags'           => string[],  // contains 'hazard:*', 'severity:*', 'color:*', 'provider:*'
- *    'severity'       => string|null, // minor/moderate/severe/extreme/unknown
- *    'severity_score' => float|null,  // optional ML-based [0,1]
- *    'code'           => int|null     // provider-specific code (e.g. QWeather)
+ *    'event'          => string|null,   // Title (optional)
+ *    'description'    => string|null,   // Description (optional)
+ *    'tags'           => string[],      // 'hazard:*', 'severity:*', 'color:*', 'provider:*'
+ *    'severity'       => string|null,   // 'minor'|'moderate'|'severe'|'extreme'|'unknown'
+ *    'severity_score' => float|null,    // (optional) external model output, continuous severity in [0,1]
+ *    'code'           => int|null,      // Provider-specific alert code (e.g. QWeather)
+ *    'start_ts'       => int|null,      // Alert start time (UTC seconds)
+ *    'end_ts'         => int|null       // Alert end time (UTC seconds)
  *  ]
  *
- * @param array $alerts
+ * All time-related logic is handled inside this function:
+ *  - Expired alerts (now_ts much larger than end_ts) have 0 risk;
+ *  - Active alerts use full weight;
+ *  - Future alerts are decayed according to lead time before start.
+ *
+ * @param array      $alerts  Normalized alert array
+ * @param int|null   $nowTs   Current time (UTC seconds). If null, time() is used.
+ *
  * @return array{score:int,flags:string[]}
  */
-function computeAlertsRiskScore(array $alerts)
+function computeAlertsRiskScore(array $alerts, ?int $nowTs = null)
 {
     if (empty($alerts)) {
         return ['score' => 0, 'flags' => []];
     }
 
-    // Base risk by hazard type, assuming "moderate" severity (~factor=1.0).
+    if ($nowTs === null) {
+        $nowTs = time();
+    }
+
+    // Base risk for each hazard type (roughly corresponds to a “medium-level” active alert)
     $hazardBaseRisk = [
         'extreme_cold'     => 85,
         'extreme_heat'     => 80,
@@ -1018,17 +1036,29 @@ function computeAlertsRiskScore(array $alerts)
             continue;
         }
 
-        $tags           = isset($alert['tags']) && is_array($alert['tags']) ? $alert['tags'] : [];
-        $hazards        = extractHazardsFromTags($tags);
-        $severity       = isset($alert['severity']) ? (string)$alert['severity'] : null;
-        $severityScore  = isset($alert['severity_score']) && is_numeric($alert['severity_score'])
-                        ? (float)$alert['severity_score'] : null;
+        $tags          = isset($alert['tags']) && is_array($alert['tags']) ? $alert['tags'] : [];
+        $hazards       = extractHazardsFromTags($tags);
+        $severity      = isset($alert['severity']) ? (string)$alert['severity'] : null;
+        $severityScore = isset($alert['severity_score']) && is_numeric($alert['severity_score'])
+                       ? (float)$alert['severity_score'] : null;
+
+        $startTs = isset($alert['start_ts']) && is_numeric($alert['start_ts']) ? (int)$alert['start_ts'] : null;
+        $endTs   = isset($alert['end_ts'])   && is_numeric($alert['end_ts'])   ? (int)$alert['end_ts']   : null;
 
         if (empty($hazards)) {
             $hazards = ['other'];
         }
 
-        // Severity factor scales base risk (blue/yellow/orange/red etc.)
+        // 1) Time factor: future / active / expired
+        $timeInfo   = mapAlertTimeFactor($startTs, $endTs, $nowTs);
+        $timeFactor = $timeInfo['factor'];
+
+        if ($timeFactor <= 0.0) {
+            $allFlags[] = 'phase_past';
+            continue;
+        }
+
+        // 2) Severity factor
         $sevFactor = mapSeverityToFactor($severity, $severityScore);
 
         foreach ($hazards as $h) {
@@ -1038,14 +1068,19 @@ function computeAlertsRiskScore(array $alerts)
 
             $base = $hazardBaseRisk[$h];
 
-            $risk = (int)round($base * $sevFactor);
+            // 3) Combined risk = base × severity factor × time factor
+            $risk = (int)round($base * $sevFactor * $timeFactor);
             $risk = max(0, min(100, $risk));
 
             $overallScore = max($overallScore, $risk);
-            $allFlags[]   = 'alert_' . $h;
+
+            $allFlags[] = 'alert_' . $h;
 
             if ($severity !== null) {
-                $allFlags[] = 'severity_' . strtolower($severity);
+                $allFlags[] = 'severity_' . cei_strlower_safe($severity);
+            }
+            if ($timeInfo['phase'] !== '') {
+                $allFlags[] = 'phase_' . $timeInfo['phase'];
             }
         }
     }
@@ -1059,11 +1094,12 @@ function computeAlertsRiskScore(array $alerts)
 }
 
 /**
- * Extract hazard types from alert tags.
+ * Extract a list of hazard types from the tags array.
  *
- * Example tags:
+ * Example:
  *   ['hazard:wind', 'hazard:flood', 'severity:severe', 'provider:qweather']
- * -> returns ['wind', 'flood']
+ * Returns:
+ *   ['wind', 'flood']
  *
  * @param array $tags
  * @return array
@@ -1088,10 +1124,11 @@ function extractHazardsFromTags(array $tags): array
 }
 
 /**
- * Map severity (and optional ML severity_score) to a numeric factor.
+ * Map alert severity (text or model score) to a scaling factor.
  *
- * If severity_score is provided, it must be in [0,1] and is mapped to [0.7, 1.4].
- * Otherwise we map string labels (minor/moderate/severe/extreme) to fixed factors.
+ * Logic:
+ *  - If severity_score ∈ [0,1] is provided, linearly map it to [0.7, 1.4]
+ *  - Otherwise map severity 'minor'/'moderate'/'severe'/'extreme' to fixed factors
  *
  * @param string|null $severity
  * @param float|null  $severityScore
@@ -1101,14 +1138,14 @@ function mapSeverityToFactor(?string $severity, ?float $severityScore = null): f
 {
     if ($severityScore !== null) {
         $x = max(0.0, min(1.0, $severityScore));
-        return 0.7 + 0.7 * $x; // linear interpolation between 0.7 and 1.4
+        return 0.7 + 0.7 * $x;
     }
 
     if ($severity === null) {
         return 1.0;
     }
 
-    switch (strtolower(trim($severity))) {
+    switch (cei_strlower_safe(trim($severity))) {
         case 'minor':
             return 0.7;
         case 'moderate':
@@ -1124,7 +1161,52 @@ function mapSeverityToFactor(?string $severity, ?float $severityScore = null): f
 }
 
 /**
- * Safe lowercase helper with UTF-8 support.
+ * Time factor mapping:
+ *
+ * - If the alert has clearly ended and more than 1 hour has passed: factor = 0, phase = 'past'
+ * - If it is currently active: factor = 1.0, phase = 'active'
+ * - If it has not started yet: decay according to lead time, keeping some constraint from future alerts but weaker than active ones
+ *
+ * @param int|null $startTs  Alert start time (UTC seconds)
+ * @param int|null $endTs    Alert end time (UTC seconds)
+ * @param int      $nowTs    Current time (UTC seconds)
+ * @return array{factor:float,phase:string}
+ */
+function mapAlertTimeFactor(?int $startTs, ?int $endTs, int $nowTs): array
+{
+    // Completely unknown timing: treat as “current/near-term”, factor = 1.0, but mark as unknown_time
+    if ($startTs === null && $endTs === null) {
+        return ['factor' => 1.0, 'phase' => 'unknown_time'];
+    }
+
+    // Has an end time and is clearly over (with a 1-hour buffer)
+    if ($endTs !== null && $nowTs > $endTs + 3600) {
+        return ['factor' => 0.0, 'phase' => 'past'];
+    }
+
+    // If start time exists and now is before it → future alert
+    if ($startTs !== null && $nowTs < $startTs) {
+        $leadHours = ($startTs - $nowTs) / 3600.0;
+
+        if ($leadHours <= 3) {
+            return ['factor' => 0.8, 'phase' => 'lead_0_3h'];
+        } elseif ($leadHours <= 12) {
+            return ['factor' => 0.6, 'phase' => 'lead_3_12h'];
+        } elseif ($leadHours <= 24) {
+            return ['factor' => 0.45, 'phase' => 'lead_12_24h'];
+        } elseif ($leadHours <= 48) {
+            return ['factor' => 0.3, 'phase' => 'lead_24_48h'];
+        } else {
+            return ['factor' => 0.2, 'phase' => 'lead_gt_48h'];
+        }
+    }
+
+    // Other cases (already started but not ended / only end time and not yet expired / only start time and now >= start)
+    return ['factor' => 1.0, 'phase' => 'active'];
+}
+
+/**
+ * String lowercase helper.
  *
  * @param string $str
  * @return string

@@ -1,16 +1,15 @@
 <?php
 
 /**
- * CEI v3.1.0 - 舒适环境指数（Comfort Environment Index）
+ * CEI v3.0.0 - 舒适环境指数（Comfort Environment Index）(已弃用)
  * -------------------------------------------------------
- * 「Alerts 时效更新」
+ * 「风险感知 / 极端条件更新」
+ * 
+ * !!! 此版本已被 CEI v3.1.0 取代 !!!
  *
  * 本版本将 CEI 明确拆分为两层：
  *   - 环境舒适层（热舒适、空气质量、紫外线、气压）
  *   - 安全风险上限层（极端冷暖、危险天气现象、官方气象预警）
- * 
- * 官方气象预警更新：
- *   - 添加 start_ts 和 end_ts 支持在风险评分中区分未开始、进行中和已过期预警，优化提前预警场景下的风险约束。
  *
  * 最终 CEI 计算公式：
  *   CEI = min(舒适度层 CEI, 安全风险上限 RiskCap)
@@ -192,7 +191,7 @@ function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
     // --- 9. 风险层：极端温度 / 天气现象 / 官方预警 ----------------------
     $tempRisk    = computeTemperatureRiskScore($T, $RH, $wind, $windGust, $dewPoint, $heatIndex);
     $weatherRisk = computeWeatherRiskScore($weatherId, $windGust);
-    $alertsRisk  = computeAlertsRiskScore($alerts,); // 此处支持传入 $nowTs ，如果不传入，则使用当前 Unix 时间
+    $alertsRisk  = computeAlertsRiskScore($alerts);
 
     // 当前 v3 策略：三者取最大值作为总风险
     $riskScore = max($tempRisk['score'], $weatherRisk['score'], $alertsRisk['score']);
@@ -970,42 +969,27 @@ function computeWeatherRiskScore($weatherId, $windGust = null)
 
 /**
  * 基于官方天气预警（alerts）的风险评分。
+ * 预警需先由适配层转换为统一结构：
  *
- * 预警需先由适配层转换为统一结构（与数据源无关）：
- *
- *  每条 alert 为一个关联数组：
  *  [
  *    'event'          => string|null,   // 标题（可选）
  *    'description'    => string|null,   // 描述（可选）
  *    'tags'           => string[],      // 'hazard:*', 'severity:*', 'color:*', 'provider:*'
  *    'severity'       => string|null,   // 'minor'|'moderate'|'severe'|'extreme'|'unknown'
- *    'severity_score' => float|null,    // （可选）外部模型输出的 [0,1] 连续严重度
- *    'code'           => int|null,      // 数据源内部预警代码（如 QWeather）
- *    'start_ts'       => int|null,      // 预警开始时间（UTC 秒）
- *    'end_ts'         => int|null       // 预警结束时间（UTC 秒）
+ *    'severity_score' => float|null,    // 可选，模型输出的 [0,1] 严重程度
+ *    'code'           => int|null       // 数据源内部预警代码（如 QWeather）
  *  ]
  *
- * 时间相关逻辑在本函数内部统一处理：
- *  - 已过期预警（now_ts 远大于 end_ts）风险为 0；
- *  - 正在生效的预警使用完整权重；
- *  - 尚未生效的预警按距开始时间的提前量衰减。
- *
- * @param array      $alerts  规范化后的预警数组
- * @param int|null   $nowTs   当前时间（UTC 秒）。为 null 时使用 time()。
- *
+ * @param array $alerts
  * @return array{score:int,flags:string[]}
  */
-function computeAlertsRiskScore(array $alerts, ?int $nowTs = null)
+function computeAlertsRiskScore(array $alerts)
 {
     if (empty($alerts)) {
         return ['score' => 0, 'flags' => []];
     }
 
-    if ($nowTs === null) {
-        $nowTs = time();
-    }
-
-    // 各类灾害的基准风险（约对应“中等等级”预警，且正在生效）
+    // 各类灾害的基准风险（约对应“中等等级”预警）
     $hazardBaseRisk = [
         'extreme_cold'     => 85,
         'extreme_heat'     => 80,
@@ -1033,29 +1017,17 @@ function computeAlertsRiskScore(array $alerts, ?int $nowTs = null)
             continue;
         }
 
-        $tags          = isset($alert['tags']) && is_array($alert['tags']) ? $alert['tags'] : [];
-        $hazards       = extractHazardsFromTags($tags);
-        $severity      = isset($alert['severity']) ? (string)$alert['severity'] : null;
-        $severityScore = isset($alert['severity_score']) && is_numeric($alert['severity_score'])
-                       ? (float)$alert['severity_score'] : null;
-
-        $startTs = isset($alert['start_ts']) && is_numeric($alert['start_ts']) ? (int)$alert['start_ts'] : null;
-        $endTs   = isset($alert['end_ts'])   && is_numeric($alert['end_ts'])   ? (int)$alert['end_ts']   : null;
+        $tags           = isset($alert['tags']) && is_array($alert['tags']) ? $alert['tags'] : [];
+        $hazards        = extractHazardsFromTags($tags);
+        $severity       = isset($alert['severity']) ? (string)$alert['severity'] : null;
+        $severityScore  = isset($alert['severity_score']) && is_numeric($alert['severity_score'])
+                        ? (float)$alert['severity_score'] : null;
 
         if (empty($hazards)) {
             $hazards = ['other'];
         }
 
-        // 1) 时间因子：未来/当前/已过期
-        $timeInfo   = mapAlertTimeFactor($startTs, $endTs, $nowTs);
-        $timeFactor = $timeInfo['factor'];
-
-        if ($timeFactor <= 0.0) {
-            $allFlags[] = 'phase_past';
-            continue;
-        }
-
-        // 2) 严重程度因子
+        // 严重程度因子（结合预警颜色/级别/可选模型评分）
         $sevFactor = mapSeverityToFactor($severity, $severityScore);
 
         foreach ($hazards as $h) {
@@ -1065,19 +1037,14 @@ function computeAlertsRiskScore(array $alerts, ?int $nowTs = null)
 
             $base = $hazardBaseRisk[$h];
 
-            // 3) 综合风险 = 基准 × 严重度 × 时间因子
-            $risk = (int)round($base * $sevFactor * $timeFactor);
+            $risk = (int)round($base * $sevFactor);
             $risk = max(0, min(100, $risk));
 
             $overallScore = max($overallScore, $risk);
-
-            $allFlags[] = 'alert_' . $h;
+            $allFlags[]   = 'alert_' . $h;
 
             if ($severity !== null) {
-                $allFlags[] = 'severity_' . cei_strlower_safe($severity);
-            }
-            if ($timeInfo['phase'] !== '') {
-                $allFlags[] = 'phase_' . $timeInfo['phase'];
+                $allFlags[] = 'severity_' . strtolower($severity);
             }
         }
     }
@@ -1135,14 +1102,14 @@ function mapSeverityToFactor(?string $severity, ?float $severityScore = null): f
 {
     if ($severityScore !== null) {
         $x = max(0.0, min(1.0, $severityScore));
-        return 0.7 + 0.7 * $x;
+        return 0.7 + 0.7 * $x; // 0.7 ~ 1.4 线性插值
     }
 
     if ($severity === null) {
         return 1.0;
     }
 
-    switch (cei_strlower_safe(trim($severity))) {
+    switch (strtolower(trim($severity))) {
         case 'minor':
             return 0.7;
         case 'moderate':
@@ -1158,52 +1125,7 @@ function mapSeverityToFactor(?string $severity, ?float $severityScore = null): f
 }
 
 /**
- * 时间因子映射：
- *
- * - 若已明确结束且超过 1 小时：factor = 0，phase = 'past'
- * - 若正在生效：factor = 1.0，phase = 'active'
- * - 若尚未开始：按提前量衰减，对“未来预警”保留一定约束但弱于当前
- *
- * @param int|null $startTs  预警生效开始时间（UTC 秒）
- * @param int|null $endTs    预警结束时间（UTC 秒）
- * @param int      $nowTs    当前时间（UTC 秒）
- * @return array{factor:float,phase:string}
- */
-function mapAlertTimeFactor(?int $startTs, ?int $endTs, int $nowTs): array
-{
-    // 完全未知时间：视为“当前/临近”，给 1.0，但标记 unknown_time
-    if ($startTs === null && $endTs === null) {
-        return ['factor' => 1.0, 'phase' => 'unknown_time'];
-    }
-
-    // 有结束时间且明显已结束（留 1 小时缓冲）
-    if ($endTs !== null && $nowTs > $endTs + 3600) {
-        return ['factor' => 0.0, 'phase' => 'past'];
-    }
-
-    // 若有开始时间且当前在开始之前 → 未来预警
-    if ($startTs !== null && $nowTs < $startTs) {
-        $leadHours = ($startTs - $nowTs) / 3600.0;
-
-        if ($leadHours <= 3) {
-            return ['factor' => 0.8, 'phase' => 'lead_0_3h'];
-        } elseif ($leadHours <= 12) {
-            return ['factor' => 0.6, 'phase' => 'lead_3_12h'];
-        } elseif ($leadHours <= 24) {
-            return ['factor' => 0.45, 'phase' => 'lead_12_24h'];
-        } elseif ($leadHours <= 48) {
-            return ['factor' => 0.3, 'phase' => 'lead_24_48h'];
-        } else {
-            return ['factor' => 0.2, 'phase' => 'lead_gt_48h'];
-        }
-    }
-
-    // 其他情况（已经开始但未结束 / 只有结束时间但尚未过期 / 只有开始时间且 now >= start）
-    return ['factor' => 1.0, 'phase' => 'active'];
-}
-
-/**
- * 字符串小写转换工具
+ * 安全的字符串小写转换工具，优先使用 mb_strtolower（UTF-8）。
  *
  * @param string $str
  * @return string
