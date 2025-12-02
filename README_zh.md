@@ -435,7 +435,7 @@ require 'cei.php';
 ### 🌤 通过 OpenWeather 获取天气数据
 
 CEI 算法默认面向 **OpenWeather One Call 3.0 API** 与 **Air Pollution API** 的数据结构，
-并通过适配器支持其他数据源（如 QWeather 和风天气）转换为统一输入格式。
+CEI 同样支持其他数据源（如 QWeather 和风天气）输入天气数据。
 
 #### 1️⃣ 准备 OpenWeather API Key
 
