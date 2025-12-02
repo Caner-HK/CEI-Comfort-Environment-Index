@@ -432,8 +432,6 @@ git clone https://github.com/Caner-HK/CEI-Comfort-Environment-Index
 require 'cei.php';
 ```
 
----
-
 ### 🌤 通过 OpenWeather 获取天气数据
 
 CEI 算法默认面向 **OpenWeather One Call 3.0 API** 与 **Air Pollution API** 的数据结构，
