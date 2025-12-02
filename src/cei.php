@@ -1,9 +1,9 @@
 <?php
 
 /**
- * CEI v3.1.0 - Comfort Environment Index
+ * CEI v3.1.1 - Comfort Environment Index
  * --------------------------------------
- * "Alerts expiration update"
+ * "Alerts expiration update" "Southern Hemisphere Climate Zone Correction"
  *
  * This version separates:
  *   - a comfort layer (thermal, air quality, UV, pressure)
@@ -287,16 +287,22 @@ function getCEILevel($cei) {
 }
 
 /**
- * Derive climate context from latitude and month:
- *  - climate zone (equatorial / tropical / subtropical / temperate / cold_temperate / polar)
- *  - seasonal factor
- *  - baseline comfort temperature in °C
+ * Estimate climate context from latitude and month:
+ *  - Climate zone (equatorial / tropical / subtropical / temperate / cold_temperate / polar)
+ *  - Seasonal factor (factor) used for light-scale adjustment
+ *  - Baseline comfort temperature comfortTemp (°C)
  *
- * @param float $latitude
- * @param int   $month
- * @return array
+ * Notes:
+ *  - Climate zone is determined by |latitude|, symmetric between hemispheres;
+ *  - Season is determined using a “local month” (south hemisphere shifted by 6 months)
+ *    to avoid mis-classifying cities like Brisbane.
+ *
+ * @param float $latitude Actual latitude
+ * @param int   $month    Calendar month 1–12
+ * @return array{zone:string,factor:float,comfortTemp:float}
  */
-function getClimateContext($latitude, $month) {
+function getClimateContext($latitude, $month)
+{
     $absLat = abs($latitude);
 
     if ($absLat < 10) {
@@ -319,54 +325,82 @@ function getClimateContext($latitude, $month) {
         $comfortTemp = 18;
     }
 
-    // Simple seasonal tweak: slightly warmer preference in summer, cooler in winter
-    if (in_array($month, [6, 7, 8], true)) {
+    // Map calendar month to “local month” (shift by 6 months in southern hemisphere)
+    $monthNorm = ($month >= 1 && $month <= 12) ? (int)$month : 1;
+    if ($latitude < 0) {
+        $monthNorm = (($monthNorm + 5) % 12) + 1;
+    }
+
+    // Light comfortTemp adjustment for local summer / winter
+    if (in_array($monthNorm, [6, 7, 8], true)) {
         $comfortTemp += 1;
-    } elseif (in_array($month, [12, 1, 2], true)) {
+    } elseif (in_array($monthNorm, [12, 1, 2], true)) {
         $comfortTemp -= 1;
     }
 
+    // Seasonal factor (light scaling), uses the same hemisphere logic internally
     $factor = adjustForClimate($latitude, $month);
 
     return [
         'zone'        => $climateZone,
         'factor'      => $factor,
-        'comfortTemp' => $comfortTemp
+        'comfortTemp' => $comfortTemp,
     ];
 }
 
 /**
- * Seasonal/climate factor that lightly scales the comfort CEI.
+ * Seasonal / climate factor used to lightly scale the comfort CEI.
  *
- * This is intentionally simple: it should be calibrated with data in future versions.
+ * Design principles:
+ *  - Use absolute latitude to assign climate zones (symmetric N/S);
+ *  - Use “local month” (monthNorm) so that southern hemisphere seasons
+ *    mirror northern hemisphere seasons;
+ *  - Only apply mild scaling to edge/extreme climate zones to avoid
+ *    over-steering the main CEI score.
  *
- * @param float $latitude
- * @param int   $month
- * @return float
+ * @param float $latitude Actual latitude
+ * @param int   $month    Calendar month 1–12
+ * @return float          Seasonal scaling factor
  */
-function adjustForClimate($latitude, $month) {
-    $climateZone = 'temperate';
-    if ($latitude < 23.5) {
+function adjustForClimate($latitude, $month)
+{
+    $absLat = abs($latitude);
+
+    if ($absLat < 10) {
+        $climateZone = 'equatorial';
+    } elseif ($absLat < 23.5) {
         $climateZone = 'tropical';
-    } elseif ($latitude > 66.5) {
+    } elseif ($absLat < 35) {
+        $climateZone = 'subtropical';
+    } elseif ($absLat < 55) {
+        $climateZone = 'temperate';
+    } elseif ($absLat < 66.5) {
+        $climateZone = 'cold_temperate';
+    } else {
         $climateZone = 'polar';
+    }
+
+    // Convert calendar month to “local month”
+    $monthNorm = ($month >= 1 && $month <= 12) ? (int)$month : 1;
+    if ($latitude < 0) {
+        $monthNorm = (($monthNorm + 5) % 12) + 1;
     }
 
     $seasonFactor = 1.0;
 
-    // Northern hemisphere summer
-    if (in_array($month, [6, 7, 8], true)) {
+    // Local summer (months 6–8)
+    if (in_array($monthNorm, [6, 7, 8], true)) {
         if ($climateZone === 'tropical') {
             $seasonFactor = 1.1;
-        } elseif ($climateZone === 'polar') {
+        } elseif (in_array($climateZone, ['polar', 'cold_temperate'], true)) {
             $seasonFactor = 0.9;
         }
     }
-    // Northern hemisphere winter
-    elseif (in_array($month, [12, 1, 2], true)) {
+    // Local winter (months 12–2)
+    elseif (in_array($monthNorm, [12, 1, 2], true)) {
         if ($climateZone === 'tropical') {
             $seasonFactor = 0.9;
-        } elseif ($climateZone === 'polar') {
+        } elseif (in_array($climateZone, ['polar', 'cold_temperate'], true)) {
             $seasonFactor = 1.1;
         }
     }

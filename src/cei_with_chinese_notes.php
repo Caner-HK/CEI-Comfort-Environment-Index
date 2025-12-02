@@ -1,9 +1,9 @@
 <?php
 
 /**
- * CEI v3.1.0 - 舒适环境指数（Comfort Environment Index）
+ * CEI v3.1.1 - 舒适环境指数（Comfort Environment Index）
  * -------------------------------------------------------
- * 「Alerts 时效更新」
+ * 「Alerts 时效更新」「南半球气候区修正」
  *
  * 本版本将 CEI 明确拆分为两层：
  *   - 环境舒适层（热舒适、空气质量、紫外线、气压）
@@ -297,16 +297,22 @@ function getCEILevel($cei) {
 /**
  * 根据纬度与月份估算气候上下文信息：
  *  - 气候带（equatorial / tropical / subtropical / temperate / cold_temperate / polar）
- *  - 季节因子 factor
+ *  - 季节因子 factor（用于整体轻度缩放）
  *  - 基础舒适温度 comfortTemp (°C)
  *
- * @param float $latitude
- * @param int   $month
- * @return array
+ * 注意：
+ *  - 气候带基于 |纬度|，南北半球对称；
+ *  - 季节判断使用“本地月份”（南半球做 6 个月平移），避免布里斯班这类城市被误判季节。
+ *
+ * @param float $latitude 实际纬度
+ * @param int   $month    自然月 1–12
+ * @return array{zone:string,factor:float,comfortTemp:float}
  */
-function getClimateContext($latitude, $month) {
+function getClimateContext($latitude, $month)
+{
     $absLat = abs($latitude);
 
+    // 1. 基于绝对纬度划分气候带，并给出基础舒适温度
     if ($absLat < 10) {
         $climateZone = 'equatorial';
         $comfortTemp = 26;
@@ -327,53 +333,82 @@ function getClimateContext($latitude, $month) {
         $comfortTemp = 18;
     }
 
-    // 简单季节微调：夏季稍微更耐热，冬季更能接受略低温度
-    if (in_array($month, [6, 7, 8], true)) {
+    // 2. 将自然月映射为“本地月份”（南半球做 6 个月平移，模拟反季节）
+    $monthNorm = ($month >= 1 && $month <= 12) ? (int)$month : 1;
+    if ($latitude < 0) {
+        $monthNorm = (($monthNorm + 5) % 12) + 1;
+    }
+
+    // 3. 本地夏季 / 冬季对舒适温度的轻微修正
+    if (in_array($monthNorm, [6, 7, 8], true)) {
         $comfortTemp += 1;
-    } elseif (in_array($month, [12, 1, 2], true)) {
+    } elseif (in_array($monthNorm, [12, 1, 2], true)) {
         $comfortTemp -= 1;
     }
 
+    // 4. 季节因子（轻度缩放），内部也会使用同样的南北半球逻辑
     $factor = adjustForClimate($latitude, $month);
 
     return [
         'zone'        => $climateZone,
         'factor'      => $factor,
-        'comfortTemp' => $comfortTemp
+        'comfortTemp' => $comfortTemp,
     ];
 }
 
 /**
  * 季节/气候因子，用于对舒适度 CEI 做轻度缩放。
- * 设计上保持简单，后续可通过数据进一步校准。
  *
- * @param float $latitude
- * @param int   $month
- * @return float
+ * 设计原则：
+ *  - 使用绝对纬度划分气候带（南北对称）；
+ *  - 使用“本地月份”（monthNorm），保证南半球季节与北半球镜像；
+ *  - 只对极端/边缘气候带做轻量放大/缩小，避免过度干预 CEI 主体分数。
+ *
+ * @param float $latitude 实际纬度
+ * @param int   $month    自然月 1–12
+ * @return float          季节缩放系数
  */
-function adjustForClimate($latitude, $month) {
-    $climateZone = 'temperate';
-    if ($latitude < 23.5) {
+function adjustForClimate($latitude, $month)
+{
+    $absLat = abs($latitude);
+
+    if ($absLat < 10) {
+        $climateZone = 'equatorial';
+    } elseif ($absLat < 23.5) {
         $climateZone = 'tropical';
-    } elseif ($latitude > 66.5) {
+    } elseif ($absLat < 35) {
+        $climateZone = 'subtropical';
+    } elseif ($absLat < 55) {
+        $climateZone = 'temperate';
+    } elseif ($absLat < 66.5) {
+        $climateZone = 'cold_temperate';
+    } else {
         $climateZone = 'polar';
+    }
+
+    // 将自然月转换为“本地月份”
+    $monthNorm = ($month >= 1 && $month <= 12) ? (int)$month : 1;
+    if ($latitude < 0) {
+        $monthNorm = (($monthNorm + 5) % 12) + 1;
     }
 
     $seasonFactor = 1.0;
 
-    // 北半球夏季
-    if (in_array($month, [6, 7, 8], true)) {
+    // 本地夏季（6–8 月）
+    if (in_array($monthNorm, [6, 7, 8], true)) {
         if ($climateZone === 'tropical') {
             $seasonFactor = 1.1;
-        } elseif ($climateZone === 'polar') {
+        }
+        elseif (in_array($climateZone, ['polar', 'cold_temperate'], true)) {
             $seasonFactor = 0.9;
         }
     }
-    // 北半球冬季
-    elseif (in_array($month, [12, 1, 2], true)) {
+    // 本地冬季（12–2 月）
+    elseif (in_array($monthNorm, [12, 1, 2], true)) {
         if ($climateZone === 'tropical') {
             $seasonFactor = 0.9;
-        } elseif ($climateZone === 'polar') {
+        }
+        elseif (in_array($climateZone, ['polar', 'cold_temperate'], true)) {
             $seasonFactor = 1.1;
         }
     }
