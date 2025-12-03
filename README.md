@@ -1,4 +1,3 @@
-
 <p align="center">
   <img src="./access/CWC-CEI-Logo.png" 
        alt="CEI Logo" 
@@ -18,36 +17,41 @@
 
 ---
 
-CWC CEI (Comfort Environment Index) is an intelligent algorithm that turns raw weather, air quality  
-and risk information into a unified **0–100 environment score**.
+CWC CEI (Comfort Environment Index) is an intelligent algorithm that converts  
+**weather, air quality and risk information** into a unified **0–100 environment score**.
 
-It is designed to move weather apps beyond “just showing numbers” toward real **human-centered environmental understanding** –  
-combining physical comfort, air quality, UV, pressure, and safety risk into one transparent model.
+The goal is to turn weather apps from “just showing numbers” into a true  
+**environment perception layer that understands human comfort and safety risk** –  
+combining thermal comfort, air quality, UV, pressure and extreme risk in a single,  
+explainable and machine-friendly framework.
 
 ---
 
-## 🚀 Key Concepts
+## 🚀 Core Design Overview
 
-### ✔ Two-Layer Design: Comfort Layer + Risk Cap Layer
+### ✔ Two-Layer Architecture: Comfort Layer + Risk Cap Layer
 
-Starting from **v3.0.0**, CEI is explicitly structured as a two-layer model:
+Starting from **v3.0.0**, CEI is explicitly divided into two separable but combinable layers:
 
 1. **Comfort Layer**  
-   Focuses on “how comfortable the environment feels” under normal conditions:
+   Answers the question: *“How comfortable does it feel right now?”* based on:
+
    - Thermal comfort (temperature, humidity, wind, apparent temperature)
-   - Air quality comfort (pollutants)
+   - Air comfort (multiple pollutants)
    - UV comfort
    - Pressure comfort
 
-   This produces a **0–100 comfort CEI**.
+   It produces a **0–100 comfort CEI (`comfort_cei`)**.
 
 2. **Risk Layer**  
-   Separately evaluates “how risky the environment is”, including:
-   - Extreme cold / extreme heat and associated health risks  
-   - Hazardous weather (severe thunderstorms, heavy snow, dust storms, tornadoes, strong winds, etc.)  
-   - Official weather / disaster warnings (e.g., typhoon, avalanche, flood, heavy rain, severe pollution)
+   Answers the question: *“How dangerous is it right now?”* by independently evaluating:
 
-   The risk layer outputs a **0–100 risk score** and a corresponding **RiskCap**:
+   - Extreme cold / heat and related health risks
+   - Hazardous weather (severe thunderstorms, snowstorms, dust storms, tornadoes, strong gusts, freezing rain, etc.)
+   - Official warnings from government weather / disaster agencies  
+     (typhoons, heavy rain, avalanche, floods, severe pollution, etc.)
+
+   The risk layer outputs a **0–100 `riskScore`**, then converts it to:
 
    > **RiskCap = 100 − riskScore**
 
@@ -55,103 +59,146 @@ The final CEI is defined as:
 
 > **CEI = min(Comfort CEI, RiskCap)**
 
-This means:
+Interpretation:
 
-- If the environment feels comfortable but is objectively dangerous  
-  (e.g., pleasant weather in a zone with an active avalanche warning),  
-  the **risk layer caps the score**, preventing a misleadingly “high” CEI.
-- If risks are low, CEI is mainly driven by the comfort layer.
+- If the environment *feels* comfortable but objective risk is high  
+  (e.g. sunny day but with a red avalanche warning),  
+  **RiskCap limits the upper bound of CEI**, avoiding a misleading sense of safety.
+- If risk is low, CEI is mainly driven by the comfort layer and reflects perceived comfort.
 
-The output structure exposes both layers:
+Both layers are exposed explicitly in the output for UI and AI use:
 
 - `cei` – final 0–100 index  
 - `components.risk` – risk component score  
 - `detail.comfort_cei` – comfort-only CEI  
-- `detail.risk_cap` – cap imposed by risk  
-- `detail.main_effect` – which factor dominates (heat / air / uv / pressure / risk)
+- `detail.risk_cap` – upper bound imposed by risk  
+- `detail.main_effect` – dominant factor right now (`heat` / `air` / `uv` / `pressure` / `risk`)
 
 ---
 
-### ✔ Climate Zone Model
+## 🌍 Climate Zone & Seasonal Model (Climate Context)
 
-People in different regions tolerate temperature differently. CEI encodes this via a **climate-aware model**.
+CEI assumes that **people’s comfort range for temperature differs by latitude and season**.
 
-Based on latitude and month, the algorithm classifies the location into climate zones (conceptually such as equatorial, tropical, temperate, polar, etc.),  
-and assigns a **climate-specific comfort temperature (`comfortTemp`)**.
+### ✔ Climate Zones & Comfort Temperature
 
-Seasonal adjustment is applied automatically:
+The algorithm uses the **absolute latitude (`abs(latitude)`)** to divide the world into climate zones,  
+for example:
 
-- **Summer (Jun–Aug)** – slightly raise the comfort temperature baseline  
-- **Winter (Dec–Feb)** – slightly lower the comfort temperature baseline (assuming clothing)
+- `equatorial`
+- `tropical`
+- `subtropical`
+- `temperate`
+- `cold_temperate`
+- `polar`
 
-This ensures:
+Each zone is assigned a baseline **comfort temperature `comfortTemp` (°C)** –  
+higher near the equator, lower near the poles – so that:
 
-- The same air temperature can be “acceptable” in one climate zone but “uncomfortable” in another,  
-  and CEI reflects this appropriately.
+> The same 15°C in Tokyo and in Northern Europe will not be judged identically;  
+> CEI reflects such differences in its score.
 
-The latitude + month context is also returned under `detail.climate`.
+### ✔ Southern Hemisphere Seasonal Mapping
+
+From **v3.1.1**, CEI introduces a seasonal mapping:
+
+- Input month is the natural month `month` (1–12).
+- For the Southern Hemisphere, we apply a **6-month shift** to get the *local* month `monthNorm`:
+
+  - Northern Hemisphere: `monthNorm = month`
+  - Southern Hemisphere: `monthNorm = ((month + 5) % 12) + 1`
+
+This makes:
+
+- June–August summer in the Northern Hemisphere, and  
+- December–February the mirrored summer in the Southern Hemisphere.
+
+All seasonal logic and comfort temperature adjustments are based on this **local month**,
+so cities like Brisbane are no longer misclassified as “winter using summer logic”.
+
+On top of this, CEI applies light corrections to `comfortTemp`:
+
+- Local summer (Jun–Aug) → slightly increases `comfortTemp`
+- Local winter (Dec–Feb) → slightly decreases `comfortTemp`
+
+Climate context is returned in a structured way:
+
+```php
+'detail' => [
+  'climate' => [
+    'zone'        => string, // e.g. 'temperate'
+    'factor'      => float,  // seasonal scaling factor
+    'comfortTemp' => float   // comfort temperature baseline under current local season
+  ],
+  // ...
+]
+````
 
 ---
 
-### ✔ Physical Thermal Perception
+## 🌡 Thermal Perception Model
 
-Human thermal perception is not determined by air temperature alone.  
-CEI uses a combination of physical indices to model real-world thermal comfort.
+Air temperature alone is not enough to describe how it feels.
+CEI models thermal perception using **Heat Index + Wind Chill + dew point + wind field**.
 
-#### Heat Index (hot-side perception)
+### ✔ Heat Index (Hot-Side)
 
-When conditions are warm/hot, CEI uses **Heat Index** (temperature + humidity) to capture:
+In warm or hot conditions CEI uses **Heat Index**:
 
-- Muggy feeling  
-- Heat stress / heat illness risk
+* Determined by temperature + humidity
+* Captures “mugginess” and heat stress risk
+* High temperature + high humidity → feels much hotter than the air temperature
 
-#### Wind Chill (cold-side perception)
+### ✔ Wind Chill (Cold-Side)
 
-In cold and windy conditions, wind chill can make it feel much colder than the air temperature.  
+Under **cold + windy** conditions, wind chill makes it feel much colder than the air temperature.
 CEI uses the standard North American / Canadian wind chill formula.
 
-#### Automatic Thermal Model Switching
+### ✔ Automatic Model Switching & Extension Factors
 
-- **T ≥ 20°C** → use Heat Index as the main effective temperature  
-- **T < 20°C** → use Wind Chill as the main effective temperature  
+* **T ≥ 20°C** → Heat Index is used as the primary effective temperature
+* **T < 20°C** → Wind Chill is used as the primary effective temperature
 
-Additional fields:
+Optional extension fields:
 
-- **Dew Point (`dew_point`)**  
-  When dew point is high (e.g. ≥ 24–26°C) in hot conditions, CEI applies extra penalties for oppressive humidity.
-- **Wind Gust (`wind_gust`)**  
-  Used to refine wind chill and to assess risk from sudden strong winds.
+* `dew_point`: when dew point ≥ 24–26°C and air temperature is high,
+  CEI applies extra penalties for oppressive humidity.
+* `wind_gust`: refines wind chill perception and feeds the risk layer’s strong-wind logic.
+* `feels_like`: can be used for display or debugging, but does not drive the core curve directly.
 
-The thermal section in the CEI result includes:
+Thermal details in the output:
 
-- `detail.thermal.effective_temp`  
-- `detail.thermal.heat_index`  
-- `detail.thermal.wind_chill`
-
-This makes it easy to explain *why* the environment feels hot / cold / harsh.
+```php
+'detail' => [
+  'thermal' => [
+    'effective_temp' => float, // chosen Heat Index / Wind Chill as effective temp
+    'heat_index'     => float,
+    'wind_chill'     => float
+  ],
+  // ...
+]
+```
 
 ---
 
-### ✔ Dynamic Weight Adjustment
+## ⚖️ Dynamic Weight Adjustment
 
-Different factors matter more in different weather situations.  
-CEI incorporates a **dynamic weighting system**:
+Different factors matter in different situations.
+CEI allocates dynamic weights to the four comfort components:
 
-Base weights (normalized to 1):
+* Thermal comfort: `heat`
+* Air comfort: `air`
+* UV: `uv`
+* Pressure: `pressure`
 
-- Heat comfort (`heat`)  
-- Air quality comfort (`air`)  
-- UV comfort (`uv`)  
-- Pressure comfort (`press`)
+Weights are adjusted according to real-time conditions, for example:
 
-These are then adjusted according to the current situation, for example:
+* Extreme cold / heat → increase `heat` weight
+* Elevated PM2.5 → increase `air` weight
+* UVI > 8 → increase `uv` weight
+* Strong winds → increase `heat` weight (wind chill significantly impacts perception)
 
-- High or low temperatures → increase the weight of thermal comfort  
-- Elevated PM2.5 → increase the importance of air quality  
-- UVI > 8 → boost the UV component  
-- Strong winds → give more weight to thermal comfort (because of wind chill)
-
-The final weights are exported:
+All weights are normalized to sum to 1, and returned as:
 
 ```php
 'weights' => [
@@ -160,85 +207,117 @@ The final weights are exported:
   'uv'       => float,
   'pressure' => float
 ]
-````
-
-So both UIs and AI agents can see *which dimension matters most right now*.
+```
 
 ---
 
-### ✔ Weather Condition Penalty (Using OpenWeather IDs)
+## 🌦 Weather Condition Penalty
 
-Weather type itself has a strong impact on comfort.
-CEI uses **OpenWeather weather id** to apply condition-specific penalties to thermal comfort:
+At the same temperature, “thunderstorm + strong wind + sleet” obviously feels worse than clear sky.
+CEI uses **OpenWeather `weather.id`** to apply comfort penalties to the thermal component:
 
-* **Thunderstorms (2xx)** – medium to strong penalty; heavier for severe thunderstorms
-* **Drizzle (3xx)** – mild discomfort penalty
-* **Rain (5xx)** – graded by intensity (light, moderate, heavy, freezing rain)
-* **Snow (6xx)** – graded by snow intensity & type (snow, sleet, snow showers, etc.)
-* **Atmospheric (7xx)** – mist, fog, haze, dust, sand, volcanic ash, squall, tornado
+* **Thunderstorms (2xx)** – medium to strong penalties for uncomfortable and potentially dangerous conditions
+* **Drizzle (3xx)** – mild cool/damp discomfort penalties
+* **Rain (5xx)** – different penalties for light / moderate / heavy / freezing rain
+* **Snow (6xx)** – graded by intensity and type (snow, sleet, mixed rain & snow)
+* **Atmospheric (7xx: mist, smoke, haze, dust, sand, volcanic ash, squall, etc.)**
 * **Clear (800)** – no penalty
-* **Clouds (801–804)** – from very light to moderate penalties (few clouds → overcast)
+* **Clouds (801–804)** – from almost no penalty (few clouds) to light penalties (overcast)
 
-These penalties *do not* touch the air quality score.
-They only adjust the **thermal comfort component**, better reflecting human perception.
+These penalties **only affect the thermal comfort component**,
+and do not modify the air quality score directly.
 
-In addition, the **risk layer** separately accounts for hazardous weather such as:
-
-* Severe thunderstorms
-* Heavy snowstorms
-* Dust storms / sandstorms
-* Tornadoes
-* High gusts, etc.
+For more dangerous phenomena (e.g. severe thunderstorms, tornadoes, dust storms),
+the **risk layer** performs extra safety risk evaluation on top.
 
 ---
 
-### ✔ International Air Quality Component
+## 🫧 International Air Quality Component
 
-CEI calculates a comfort score for **six pollutants** and then takes the worst one:
+CEI scores six major pollutants individually and then takes the worst one as the air comfort score:
 
-* PM2.5 – fine particulate matter
-* PM10 – inhalable particulates
-* O₃ – ozone
-* CO – carbon monoxide (converted from μg/m³ to mg/m³)
-* NO₂ – nitrogen dioxide
-* SO₂ – sulfur dioxide
+* PM2.5
+* PM10
+* O₃
+* CO (internally converted from μg/m³ to mg/m³)
+* NO₂
+* SO₂
 
-Each pollutant uses a threshold-based scale mapped to a 0–100 score.
-The final air comfort component is:
+Each pollutant score uses threshold-based mapping to 0–100. The final air comfort score is:
 
 > **AirScore = min(score_PM2.5, score_PM10, score_O3, score_CO, score_NO2, score_SO2)**
 
-This “weakest link” design matches real-world health risk:
-one pollutant being very bad is enough to cause discomfort / health concerns.
+This “weakest-link” design reflects real-world health exposure:
+
+**If any single pollutant is bad enough, overall air comfort should drop.**
 
 ---
 
-### ✔ Risk Recognition & Cap Mechanism
+## ⚠️ Risk Recognition & Alert Timings
 
-Beyond comfort, CEI v3.0.0 introduces a full **risk recognition layer**:
+### ✔ Three Sources of Risk
 
-Risk is decomposed into three sources:
+The risk layer decomposes risk into three sources:
 
 1. **Temperature Risk**
+   Based on heat index, wind chill, dew point and related indicators,
+   evaluating risks like heat stroke, frostbite, hypothermia.
+   It emits flags such as:
 
-   * Based on wind chill, heat index, dew point, and other indicators
-   * Captures frostbite / hypothermia risk and heat stress risk
-   * Exposes flags such as `temp_extreme_cold_40`, `temp_heat_35`, etc.
+   * `temp_extreme_cold_35`
+   * `temp_heat_35`
+   * `temp_windchill_-20`, etc.
 
 2. **Weather Risk**
+   Uses `weather_id` and `wind_gust` to detect:
 
-   * Uses OpenWeather `weatherId` and `wind_gust`
-   * Penalizes severe thunderstorms, freezing rain, heavy snow, dense fog, dust storms, tornadoes, etc.
-   * Exposes flags such as `wx_thunderstorm_heavy`, `wx_freezing_rain`, `wind_gust_25`
+   * Severe thunderstorms, heavy rain, snowstorms, freezing rain
+   * Dense fog, dust storms, tornadoes, etc.
+
+   And emits flags such as `wx_thunderstorm_heavy`, `wx_freezing_rain`, `wind_gust_25`.
 
 3. **Alerts Risk**
+   Uses adapter layers for OpenWeather, QWeather (HeWeather) and others,
+   normalizing provider-specific alerts into a unified structure, for example:
 
-   * Handles **official warnings** from multiple providers (e.g., OpenWeather, QWeather) via an adapter layer
-   * The adapter maps provider-specific fields into a unified structure like:
-     `hazard:wind`, `hazard:flood`, `severity:minor/moderate/severe/extreme`, `provider:xxx`
-   * Each hazard type has a base risk, modified by severity.
+   ```php
+   [
+     'event'          => 'Gale Blue Warning',
+     'description'    => 'Gale force winds expected in the next 24 hours…',
+     'tags'           => [
+       'hazard:wind',
+       'severity:minor',
+       'color:blue',
+       'provider:qweather'
+     ],
+     'severity'       => 'minor',
+     'severity_score' => null, // reserved for model-based 0–1 severity score
+     'code'           => 1006, // provider-specific code
 
-The combined outputs are:
+     'start_ts'       => 1732854000, // alert start time (Unix timestamp, UTC seconds)
+     'end_ts'         => 1732940400  // alert end time
+   ]
+   ```
+
+### ✔ Time Validity of Alerts
+
+Since **v3.1.0**, CEI accounts for alert timing when computing `alerts` risk:
+
+* Current time < `start_ts` → alert **not yet started**:
+  Considered as early warning, with **reduced** impact on risk to avoid
+  lowering CEI too early.
+
+* `start_ts` ≤ current time ≤ `end_ts` → alert **active**:
+  Counts with full weight in the risk score.
+
+* Current time > `end_ts` → alert **expired**:
+  Treated as background information; impact can be heavily reduced or ignored.
+
+All times are in **Unix timestamp (UTC seconds)** to avoid time-zone issues.
+
+### ✔ Risk Output Structure
+
+In the final result, risk-related fields look like:
 
 ```php
 'components' => [
@@ -251,31 +330,21 @@ The combined outputs are:
 
 'detail' => [
   'risk' => [
-    'overall'      => int,   // 0–100
-    'from_temp'    => int,
-    'from_weather' => int,
-    'from_alerts'  => int,
-    'flags'        => string[]
-  ]
+    'overall'      => int,      // overall risk 0–100
+    'from_temp'    => int,      // risk from temperature
+    'from_weather' => int,      // risk from weather phenomena
+    'from_alerts'  => int,      // risk from official alerts
+    'flags'        => string[]  // machine-friendly flags for explanation / AI
+  ],
+  'risk_cap' => float           // 100 - riskScore
 ]
 ```
 
-And the risk cap:
-
-```php
-'risk_cap' => float // = 100 - riskScore
-```
-
-This makes it possible to say things like:
-
-* “Comfort is high, but avalanche risk is extreme – CEI is capped at 10.”
-* “Cold and windy, but no major risk signals – CEI is low mainly due to thermal comfort.”
-
 ---
 
-### ✔ Unified, Structured Output
+## 📤 Unified, Structured Output
 
-A typical `computeCEI()` call returns:
+A typical `computeCEI()` call returns a structure like:
 
 ```php
 [
@@ -298,14 +367,14 @@ A typical `computeCEI()` call returns:
   ],
 
   'detail' => [
-    'comfort_cei' => float, // comfort layer only
-    'risk_cap'    => float, // 100 - riskScore
+    'comfort_cei' => float,              // comfort layer CEI only
+    'risk_cap'    => float,              // upper bound from risk (100 - riskScore)
     'main_effect' => 'heat'|'air'|'uv'|'pressure'|'risk',
 
     'climate' => [
-      'zone'        => string,
-      'factor'      => float,
-      'comfortTemp' => float
+      'zone'        => string,           // climate zone
+      'factor'      => float,            // seasonal scaling factor
+      'comfortTemp' => float             // comfort temperature baseline
     ],
 
     'thermal' => [
@@ -325,41 +394,49 @@ A typical `computeCEI()` call returns:
 ]
 ```
 
-This structure is:
+Properties:
 
-* **UI-friendly** – perfect for dashboards, progress bars, gauges
-* **AI-friendly** – perfect as a semantic layer for models to generate advice
-* **Machine-friendly** – easy to log, compare, aggregate, and post-process
+* **UI-friendly** – ideal for color bars, gauges, cards, timelines
+* **AI-friendly** – all key semantics are structured; models do not need to redo physics/medical reasoning
+* **Machine-friendly** – easy to log, aggregate, and feed into rule engines
 
 ---
 
-### ✔ Language- & Platform-Agnostic Core
+## 👨‍💻 Language- & Platform-Agnostic Core
 
-The CEI core is designed as a **pure computation module**:
+CEI is implemented as a **pure computation core**, independent of frameworks and I/O,
+so it can be **ported losslessly** across languages with consistent logic and precision.
 
-* No network requests inside the algorithm
-* No database or file I/O
-* All data must be provided as function parameters
-* Given the same input, CEI always returns the same output
+* Current reference implementation: **PHP**
+* Easily portable to:
 
-The reference implementation is written in **PHP**, but the logic can be ported 1:1 to:
+  * **JavaScript / TypeScript** (web front-end, Node.js back-end)
+  * **Python** (data pipelines, AI services)
+  * **Java / Kotlin** (Android, server applications)
+  * **C / C++ / Rust / Go** (embedded, high-performance back-ends)
+  * **Swift** (iOS / macOS apps)
 
-* JavaScript / TypeScript (web front-end, Node.js)
-* Python (data pipelines, AI services)
-* Java / Kotlin (Android, server-side)
-* C / C++ / Rust / Go (embedded, high-performance back-ends)
-* Swift (iOS / macOS apps)
+Core properties:
+
+* The CEI core function is a **pure function**:
+
+  * No network requests inside
+  * No database or file I/O
+  * All inputs are explicit (weather + air quality + context + alerts)
+  * Same input always yields the same output (ideal for testing and replay)
 
 This makes CEI suitable for:
 
-* Mobile weather / health apps
-* Web & API back-ends
-* IoT / edge devices (e-ink displays, home weather stations)
-* Data analytics / AI decision-making engines
+* Mobile apps (weather, health)
+* Web front-ends and back-end APIs (SaaS, open platforms)
+* IoT / edge devices (weather stations, e-ink panels)
+* Data analytics and AI decision engines (travel advice, health risk assessment)
 
 ---
 
-## 📦 Installation
+## 🧩 Integration & Example
+
+### ✔ Installation
 
 ```bash
 git clone https://github.com/Caner-HK/CEI-Comfort-Environment-Index
@@ -371,25 +448,29 @@ In your PHP project:
 require 'cei.php';
 ```
 
----
+### 🌤 Fetching Weather Data via OpenWeather
 
-## 🧩 Usage Example
+The CEI reference implementation is designed around
+**OpenWeather One Call 3.0 API** and **Air Pollution API**
+(and also supports other providers such as QWeather via adapter layers).
 
-CEI is designed to work naturally with **OpenWeather One Call 3.0** and **Air Pollution API**,
-and with other providers via adapter layers (e.g., QWeather).
+#### 1️⃣ Prepare an OpenWeather API Key
 
-### Data Sources
+1. Sign up for an OpenWeather account:
+   [https://home.openweathermap.org/users/sign_up](https://home.openweathermap.org/users/sign_up)
+2. Create and view your API keys:
+   [https://home.openweathermap.org/api_keys](https://home.openweathermap.org/api_keys)
 
-| API               | Purpose                                                                        | Docs                                                                                         |
-| ----------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
-| One Call API 3.0  | Real-time weather: temp, humidity, wind, gusts, pressure, UV, weather id, etc. | [https://openweathermap.org/api/one-call-3](https://openweathermap.org/api/one-call-3)       |
-| Air Pollution API | Pollutant concentrations: PM2.5, PM10, O₃, CO, NO₂, SO₂                        | [https://openweathermap.org/api/air-pollution](https://openweathermap.org/api/air-pollution) |
+#### 2️⃣ APIs Used
 
-You can fetch alerts from OpenWeather, QWeather or other providers, then normalize them using a separate adapter and pass them via the `alerts` field.
+| API                   | Purpose                                                                                          | Docs                                                                                         |
+| --------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| **One Call API 3.0**  | Real-time weather: temperature, humidity, wind, gusts, dew point, UV, pressure, weather id, etc. | [https://openweathermap.org/api/one-call-3](https://openweathermap.org/api/one-call-3)       |
+| **Air Pollution API** | Air quality: PM2.5, PM10, O₃, CO, NO₂, SO₂ concentrations                                        | [https://openweathermap.org/api/air-pollution](https://openweathermap.org/api/air-pollution) |
 
-### Required Fields (Core)
+#### 3️⃣ Required Fields for CEI
 
-From `current` in One Call 3.0:
+**From `current` in One Call 3.0:**
 
 * `temp`
 * `humidity`
@@ -398,10 +479,10 @@ From `current` in One Call 3.0:
 * `pressure`
 * `uvi`
 * `dew_point` (optional)
-* `feels_like` (optional, not required by the core model)
-* `weather[0].id`
+* `feels_like` (optional, for display/debug)
+* `weather[0].id` → mapped to `weather_id`
 
-From `list[0].components` in Air Pollution API:
+**From `list[0].components` in Air Pollution API:**
 
 * `pm2_5`
 * `pm10`
@@ -410,59 +491,57 @@ From `list[0].components` in Air Pollution API:
 * `no2`
 * `so2`
 
-Alerts (optional) – already normalized:
+**CEI accepts weather alerts as an optional input.**
 
-```php
-$normalizedAlerts = [
-  [
-    'event'          => 'Gale Blue Warning',
-    'description'    => 'Gale force winds expected in the next 24 hours…',
-    'tags'           => [
-      'hazard:wind',
-      'severity:minor',
-      'color:blue',
-      'provider:qweather'
-    ],
-    'severity'       => 'minor',
-    'severity_score' => null,
-    'code'           => 1006
+One Call API 3.0 exposes governmental alerts via `alerts`.
+You can feed these into a model or mapping layer and produce the CEI alert structure:
 
-    'start_ts'       => 1732854000, // Alert start time (Unix Timestamp)
-    'end_ts'         => 1732940400, // Alert end time (Unix Timestamp)
-  ],
-  // ...
-];
-```
+* `event` – alert title
+* `description` – alert body text
+* `tags` – array of semantic tags (e.g. hazards, provider)
+* `severity` – text severity label
+* `severity_score` – numeric severity from a model (0–1)
+* `code` – provider’s internal code
+* `start_ts` / `end_ts` – alert validity window (Unix timestamps, UTC seconds)
 
-### Example Call
+At CEI call time, you only need to pass a `$data` array containing these fields.
+
+### 💻 Example Call
 
 ```php
 require 'cei.php';
 
+// 1. Extract and normalize data from One Call + Air Pollution
 $data = [
+    // ——— Real-time weather (from One Call API 3.0: current) ———
     'temp'       => -1.0,
     'humidity'   => 26,
     'wind_speed' => 1.9,
     'wind_gust'  => 2.8,   // optional
     'dew_point'  => -16.0, // optional
-    'feels_like' => -3.5,  // optional (doesn't drive the core curve directly)
+    'feels_like' => -3.5,  // optional
+    'uvi'        => 0.0,
+    'pressure'   => 1023,
+    'weather_id' => 800,   // from current.weather[0].id
+
+    // ——— Air quality (from Air Pollution API: list[0].components) ———
     'pm2_5'      => 8,
     'pm10'       => 16,
     'o3'         => 40,
     'co'         => 180,
     'no2'        => 12,
     'so2'        => 5,
-    'uvi'        => 0.0,
-    'pressure'   => 1023,
 
-    'alerts'     => $normalizedAlerts, // may be an empty array if no alerts
-    'weather_id' => 800,
+    // ——— Alerts (optional, normalized by an adapter layer) ———
+    'alerts'     => $normalizedAlerts ?? [],
 ];
 
+// 2. Units and spatiotemporal context
 $unit     = 'metric'; // 'metric' / 'imperial' / 'standard'
-$latitude = 36.1;     // used for climate zone and seasonal adjustment
-$month    = 11;       // 1–12
+$latitude = 36.1;     // used for climate zone & seasonal adjustment
+$month    = 11;       // current month (1–12)
 
+// 3. Call CEI core function
 $cei = computeCEI($unit, $data, $latitude, $month);
 
 print_r($cei);
@@ -470,94 +549,93 @@ print_r($cei);
 
 ---
 
-## 🤖 CEI as a Low-Cost AI “Perception Layer”
+## 🧠 CEI as a Low-Cost AI “Environment Perception Layer”
 
-Most general-purpose AI models can read “temperature: -3°C, wind: 6 m/s, PM2.5: 60”,
-but they do not inherently understand what this **feels like** or **how risky it is**.
+Large models can read numbers like “temperature −3°C, wind 6 m/s, PM2.5 60”,
+but small models often struggle to reliably infer:
 
-CEI fills that gap by acting as a **Human-Perception & Risk Layer** for AI:
+* What this really *feels like* to a person
+* Whether it implies meaningful health or safety risk
+* How to interpret the same conditions across different climate zones
 
-* Converts raw weather & pollution into structured, human-meaningful features
-* Encodes climate context, thermal indices, pollution, risk, and alerts
-* Produces a stable 0–100 index plus interpretable sub-scores and flags
+CEI provides a structured **Comfort & Risk Semantic Layer**
+that lets even small models generate high-quality explanations and advice.
 
-### Why CEI is especially useful for small / cheap models
-
-Small models (on mobile, edge, or low-cost servers):
-
-* Cannot perform deep physical & medical reasoning reliably
-* But **can** learn to interpret a structured schema like CEI
-
-With CEI, your training task becomes:
+### ✔ Typical Training Pattern
 
 ```text
-Input:   Weather data + CEI structure
-Output:  Natural-language advice or explanation
+Input:  Raw weather data + computed CEI structure
+Output: Natural-language explanation/advice for the user
 ```
 
-The model no longer has to reinvent:
+The model learns that:
 
-* Climate-zone sensitivity
-* Heat index / wind chill logic
-* Pollutant health impacts
-* Risk interpretation from alerts
+* Lower CEI → less suitable for outdoor activities
+* Wind chill / heat index / high dew point → emphasize cold/heat and hydration advice
+* Low air component → recommend masks / avoid intense exercise
+* `risk.flags` containing avalanche / flash-flood / typhoon → highlight severe safety risks
 
-Instead, it learns: “Given this CEI structure, what should I tell the user?”
+The model does **not** need to re-implement meteorology and medical models.
 
 Benefits:
 
-* **Much cheaper training & inference**
-* **Higher stability & consistency** across responses
-* **Easy to deploy on-device or on low-cost servers**
-* Often **better than a large model** that sees only raw weather numbers
+* Greatly reduced training and inference cost
+* Stable, consistent outputs – less likely to “hallucinate risk”
+* Deployable on phones, edge devices and low-spec servers
+* In many business scenarios, **small model + CEI** outperforms
+  **large model + raw weather data** in stability and controllability
 
 ---
 
 ## 📊 Version History
 
-| Version | Date       | Description                                                                                                                                                                                                                                   |
-| ------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| v1.0.0  | 2025-11-14 | Initial release: basic CEI with temperature, humidity, wind and simple weighting.                                                                                                                                                             |
-| v2.0.0  | 2025-11-17 | Climate- & condition-aware update: added climate zone model, weather-type penalties, wind chill, heat index, dynamic weights and improved air quality scoring.                                                                                |
-| v3.0.0  | 2025-11-28 | Risk-aware / extreme conditions update: introduced a separate risk layer (temperature, hazardous weather, official alerts), RiskCap mechanism, structured risk outputs and support for `dew_point`, `wind_gust`, `alerts` and related fields. |
-| v3.1.0 | 2025-11-29 | Alerts expiration update: Add `start_ts` / `end_ts` (Unix timestamps, UTC seconds) to unify the alerts structure, support the differentiation of alerts that have not started, are in progress, and have expired in the risk score, and optimize the risk constraints in early warning scenarios. |
-| v3.1.1 | 2025-12-02 | Southern Hemisphere Climate Zone Correction: Climate zones are redefined based on absolute latitude, and a seasonal mapping (monthNorm) for the Southern Hemisphere is added to fix issues related to Southern Hemisphere climate zones. |
+| Version | Date       | Description                                                                                                                                                                                                                                                                                                |
+| ------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| v1.0.0  | 2025-11-14 | Initial release: basic CEI computation with temperature, humidity, wind and a simple weighting scheme.                                                                                                                                                                                                     |
+| v2.0.0  | 2025-11-17 | Climate & condition-aware update: added climate zone model, weather-type discomfort penalties, wind chill, heat index, dynamic weights and more refined air quality scoring, all mapped to a unified 0–100 scale.                                                                                          |
+| v3.0.0  | 2025-11-28 | Risk-aware / extreme-conditions update: introduced a separate risk layer (extreme temperatures, hazardous weather, official alerts), a RiskCap mechanism, structured risk breakdown outputs, and support for `dew_point`, `wind_gust`, `alerts` and related fields.                                        |
+| v3.1.0  | 2025-11-29 | Alert timing update: added `start_ts` / `end_ts` (Unix timestamps, UTC seconds) to the unified alerts structure; differentiated “not started / active / expired” alerts in the risk score; improved risk constraints in early-warning scenarios to avoid over-penalizing CEI before events actually begin. |
+| v3.1.1  | 2025-12-02 | Southern Hemisphere climate fix: redefined climate zones based on absolute latitude and introduced Southern Hemisphere seasonal mapping (`monthNorm`), correcting summer/winter classification and comfort temperature for Southern Hemisphere cities, improving global behavior over cold/warm regions.   |
 
-> **Current version: v3.1.1 – Southern Hemisphere Climate Zone Correction**
+> **Current version: v3.1.1 – Southern Hemisphere Climate Fix**
 
 ---
 
 ## 🤝 Contributing
 
-We welcome contributions from developers, researchers, meteorologists and AI practitioners.
+Developers, researchers, meteorologists and AI practitioners are all welcome to contribute to CEI.
 
-### How to contribute
+### ✔ How You Can Help
 
-* **Open an Issue**
+* **Open Issues**
 
   * Report bugs
-  * Propose improvements to the comfort or risk model
-  * Suggest new climate / regional tunings
+  * Propose model improvements (thermal curve, AQ thresholds, risk logic, weighting)
+  * Suggest new climate zones, city/local tuning or additional alert sources
 
-* **Open a Pull Request (PR)**
-  You can contribute:
+* **Open Pull Requests (PRs)**
 
   * Bug fixes
-  * Model improvements (thermal curve, AQ thresholds, risk logic, etc.)
-  * New data source adapters (more weather/alert providers)
-  * Ports to other languages (JS / Python / Go / Rust / …)
-  * Documentation (guides, examples, diagrams)
+  * Model enhancements (comfort, air quality, risk evaluation)
+  * New data source adapters (more national/regional weather & alert platforms)
+  * New language ports (JS / Python / Go / Rust / …)
+  * Documentation & examples (integration guides, use cases, diagrams)
 
 * **Share Data & Feedback**
-  Real-world feedback from different climates / user groups / use-cases is highly valuable
-  for future calibration and data-driven CEI evolution.
 
-### Project Vision
+  * Real-world perception & feedback from different climates, user groups and scenarios
+  * These will inform future calibration and data-driven evolution of CEI
 
-Our goal is to make CEI the **most transparent, open and practical environment comfort & risk index** –
-a bridge between scientific models and human perception, and a solid foundation for future
-intelligent weather assistants and environment-aware AI systems.
+### ✔ Project Vision
+
+Our goal is to make CEI an **open, transparent, verifiable and extensible standard**
+for environment comfort & risk:
+
+A robust bridge between scientific models and human perception,
+and a foundational building block for the next generation of intelligent weather assistants
+and environment-aware AI systems.
 
 ---
 
-If you find this project useful, consider giving the repository a ⭐ Star.
+If you find this project useful, please consider giving the repository a ⭐ Star.
+

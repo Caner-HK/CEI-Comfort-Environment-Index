@@ -3,7 +3,7 @@
 /**
  * CEI v3.1.1 - Comfort Environment Index
  * --------------------------------------
- * "Alerts expiration update" "Southern Hemisphere Climate Zone Correction"
+ * "Alert timing update" "Southern Hemisphere Climate Fix"
  *
  * This version separates:
  *   - a comfort layer (thermal, air quality, UV, pressure)
