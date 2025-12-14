@@ -1,56 +1,111 @@
 <?php
-
 /**
- * CEI v3.1.1 - Comfort Environment Index
- * --------------------------------------
- * "Alert timing update" "Southern Hemisphere Climate Fix"
+ * CEI 3.2.0 - Comfort Environment Index
+ * -------------------------------------------------------
+ * "Correlation-aware hazard fusion", "Alert-body synergy", "forecast-time evaluation ts support"
  *
- * This version separates:
- *   - a comfort layer (thermal, air quality, UV, pressure)
- *   - a safety/risk cap layer (extreme temperature, severe weather, official alerts)
- * 
- * Alert function update:
- *   - Add start_ts and end_ts, support the differentiation of alerts that have not started, are in progress, and have expired in the risk score, and optimize the risk constraints in early warning scenarios.
+ * This version explicitly splits CEI into two layers:
+ *   - Comfort layer (thermal comfort, air quality, UV, pressure)
+ *   - Safety risk cap layer (synergy of sensations/phenomena/alerts, output RiskCap as the capping upper bound)
  *
- * Final CEI is:
- *   CEI = min(ComfortCEI, RiskCap)
+ * Key design points for the risk layer (critical fixes):
+ *   1) Correlation-aware fusion (Hazard Bucket Fusion):
+ *      - Bucket risks by hazard (e.g., extreme_cold, snow_ice, wind, heavy_rain, thunderstorm, etc.),
+ *      - For each hazard, compute simultaneously:
+ *          P: Physical risk (derived from temperature/wind chill/heat index, weather_id, gust/wind, etc.)
+ *          A: Alert signal strength (derived from alerts' hazard + severity + time phase)
+ *          Q: Alert credibility/hit-rate (composited from certainty/urgency/area/time phase labels)
+ *      - Final fused intensity R: alerts only "fill the gap", avoiding double penalty from the same source:
+ *          R = P + Q * max(0, A - P)
+ *        When the physical data already shows extreme low temperature, a "cold wave" alert will not forcibly max out the risk,
+ *        but it will increase the hazard's Focus (used for hints/suggestions to be more cautious).
+ *
+ *   2) Alert time phases and forecast evaluation moment:
+ *      - Added data['ts'] as the evaluation time (UTC seconds), used for calculating CEI at some future time in forecast scenes.
+ *      - The risk layer uses ts to determine alert phases:
+ *          lead (not started) / active (in effect) / past (expired), and attenuates or zeros alert strength accordingly.
+ *      - If ts is not provided, defaults to time().
+ *
+ *   3) Risk outputs separation (for UI and explanations):
+ *      - risk (overall): overall risk intensity (0=no risk, 100=extreme risk)
+ *      - risk_cap: the actual capping upper bound (0–100)
+ *      - risk_hint: more sensitive "hint score", leaning more toward max(P, A) (good for reminders, not necessarily capping)
+ *      - risk_focus: focus score (higher when P and A are aligned with higher Q, for "key attention")
+ *
+ * Final CEI formula:
+ *   CEI = min(Comfort-layer CEI, Safety risk cap RiskCap)
  *
  * All scores are normalized to [0, 100].
- *
- * Input data is designed to be compatible with OpenWeather / QWeather style fields,
- * but this file itself is provider-agnostic as long as the caller prepares $data.
+ * Input fields are compatible with OpenWeather / QWeather styles, but this file itself has no dependency on a specific data source;
+ * callers only need to construct $data as agreed.
  */
 
 /**
- * Compute CEI for a given point in time.
+ * Example of output structure:
  *
- * @param string $unit      'metric' (°C, m/s), 'imperial' (°F, mph), 'standard' (K, m/s)
- * @param array  $data      Associative array with keys (raw input):
- *                          - temp       : float, air temperature
- *                          - humidity   : float, relative humidity (%)
- *                          - wind_speed : float, wind speed
- *                          - pm2_5, pm10, o3, co, no2, so2 : float, pollutant concentrations
- *                          - uvi        : float, UV index
- *                          - pressure   : float, surface pressure (hPa)
- *                          Optional extras:
- *                          - wind_gust  : float|null, gust speed
- *                          - dew_point  : float|null, dew point temperature
- *                          - feels_like : float|null, "feels like" temperature
- *                          - weather_id : int|null, OpenWeather condition id
- *                          - alerts     : array|null, pre-normalized alert objects
- * @param float $latitude   Location latitude (for climate zone adjustments)
- * @param int   $month      1–12 (UTC month of the current time)
- * @param int|null $weatherId Optional OpenWeather weather id; if null, read from data['weather_id'] or fallback 800.
+ * {
+ *   "cei": 62,
+ *   "level": "CEI Level 3 – Acceptable",
+ *   "components": { "heat": 58, "air": 80, "uv": 100, "pressure": 70, "risk": 48 },
+ *   "weights": { "heat": 0.50, "air": 0.33, "uv": 0.08, "pressure": 0.09 },
+ *   "detail": {
+ *     "comfort_cei": 71.3,
+ *     "risk_cap": 62.0,
+ *     "risk_hint": 74,
+ *     "risk_focus": 68,
+ *     "main_effect": "risk",
+ *     "climate": { "zone": "temperate", "factor": 1.0, "comfortTemp": 22 },
+ *     "thermal": { "effective_temp": -3.2, "heat_index": 0.0, "wind_chill": -6.8 },
+ *     "risk": {
+ *       "overall": 48,
+ *       "cap": 62.0,
+ *       "hint": 74,
+ *       "focus": 68,
+ *       "from_temp": 10,
+ *       "from_weather": 42,
+ *       "from_alerts": 38,
+ *       "factors": ["snow_ice","wind"],
+ *       "debug_flags": ["alerts_present","phase_active"],
+ *       "hazards": { "...": { "P":0.4,"A":0.7,"Q":0.8,"R":0.56,"Focus":0.68 } }
+ *     }
+ *   }
+ * }
+ */
+
+/**
+ * Main function to compute CEI for a single moment.
+ *
+ * @param string    $unit      Unit system:
+ *                             - 'metric'   : °C, m/s
+ *                             - 'imperial' : °F, mph
+ *                             - 'standard' : K, m/s
+ * @param array     $data      Input data, required fields:
+ *                             - temp       : float, air temperature
+ *                             - humidity   : float, relative humidity (%)
+ *                             - wind_speed : float, wind speed
+ *                             - pm2_5, pm10, o3, co, no2, so2 : float, pollutant concentrations
+ *                             - uvi        : float, UV index
+ *                             - pressure   : float, air pressure (hPa)
+ *                             Optional fields:
+ *                             - ts         : int|null, evaluation moment (UTC seconds; recommended for forecast scenes)
+ *                             - wind_gust  : float|null, gust wind speed
+ *                             - dew_point  : float|null, dew point temperature
+ *                             - feels_like : float|null, apparent temperature (for debugging/extension only)
+ *                             - weather_id : int|null, OpenWeather weather code
+ *                             - alerts     : array|null, standardized alerts after an adaptation layer
+ * @param float     $latitude  Latitude (used to determine climate zone)
+ * @param int       $month     Current month (1–12)
+ * @param int|null  $weatherId Optional weather code; when null, prefers data['weather_id'], otherwise falls back to 800 (clear).
  *
  * @return array {
  *   cei: int 0–100,
- *   level: string,
+ *   level: string level description,
  *   components: {
- *      heat: int,
- *      air: int,
- *      uv: int,
- *      pressure: int,
- *      risk: int
+ *      heat: int thermal comfort score,
+ *      air: int air comfort score,
+ *      uv: int UV comfort score,
+ *      pressure: int pressure comfort score,
+ *      risk: int risk intensity (0=no risk, 100=extreme risk)
  *   },
  *   weights: {
  *      heat: float,
@@ -59,45 +114,61 @@
  *      pressure: float
  *   },
  *   detail: {
- *      comfort_cei: float,
- *      risk_cap: float,
- *      main_effect: string 'heat'|'air'|'uv'|'pressure'|'risk',
- *      climate: array{zone:string,factor:float,comfortTemp:float},
+ *      comfort_cei: float CEI of the comfort layer only,
+ *      risk_cap: float    risk cap (0–100, the actual capping upper bound),
+ *      risk_hint: int     risk hint score (0–100, more sensitive, for reminders),
+ *      risk_focus: int    risk focus score (0–100, for "key attention"),
+ *      main_effect: string primary limiting source of current environment,
+ *                          'heat'|'air'|'uv'|'pressure'|'risk',
+ *      climate: {
+ *          zone: string climate zone name,
+ *          factor: float climate factor,
+ *          comfortTemp: float baseline comfort temperature (°C)
+ *      },
  *      thermal: {
- *         effective_temp: float,
- *         heat_index: float,
- *         wind_chill: float
+ *         effective_temp: float composite perceived temperature,
+ *         heat_index: float heat index,
+ *         wind_chill: float wind chill temperature
  *      },
  *      risk: {
- *         overall: int,
- *         from_temp: int,
- *         from_weather: int,
- *         from_alerts: int,
- *         flags: string[]
+ *         overall: int risk intensity (0–100),
+ *         cap: float risk cap,
+ *         hint: int risk hint score,
+ *         focus: int risk focus score,
+ *         from_temp: int risk contribution from temperature extremes,
+ *         from_weather: int risk contribution from weather phenomena,
+ *         from_alerts: int risk contribution from official alerts,
+ *         factors: string[] user-readable risk factors (hazard list; recommend front-end display),
+ *         debug_flags: string[] internal debug flags (do not present as "risk factors"),
+ *         hazards: array hazard bucket details (P/A/Q/R/Focus, for explanations and visualization)
+ *
  *      }
  *   }
  * }
  */
 function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
 {
-    // --- 1. Basic validation of unit and required fields --------------------
+    // 1) Unit validation
     if (!in_array($unit, ['imperial', 'metric', 'standard'], true)) {
         return ['error' => 'Invalid unit type'];
     }
 
+    // 2) Required fields validation
     $required = [
         'temp', 'humidity', 'wind_speed',
         'pm2_5', 'pm10', 'o3', 'co', 'no2', 'so2',
         'uvi', 'pressure'
     ];
-
     foreach ($required as $field) {
         if (!isset($data[$field]) || !is_numeric($data[$field])) {
             return ['error' => "Missing or invalid field: $field"];
         }
     }
 
-    // --- 2. Extract raw inputs ---------------------------------------------
+    // 3) Evaluation moment: for forecast scenes, pass a future ts (UTC seconds) to judge alert time phases
+    $evalTs = (isset($data['ts']) && is_numeric($data['ts'])) ? (int)$data['ts'] : time();
+
+    // 4) Extract core meteorological and pollutant inputs
     $T       = (float)$data['temp'];
     $RH      = (float)$data['humidity'];
     $wind    = (float)$data['wind_speed'];
@@ -110,112 +181,96 @@ function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
     $uvi     = (float)$data['uvi'];
     $press   = (float)$data['pressure'];
 
-    // Optional extra fields
+    // 5) Optional fields
     $windGust  = (isset($data['wind_gust'])  && is_numeric($data['wind_gust']))  ? (float)$data['wind_gust']  : null;
     $dewPoint  = (isset($data['dew_point'])  && is_numeric($data['dew_point']))  ? (float)$data['dew_point']  : null;
     $feelsLike = (isset($data['feels_like']) && is_numeric($data['feels_like'])) ? (float)$data['feels_like'] : null;
 
-    // --- 3. Weather id & alerts --------------------------------------------
+    // 6) Weather phenomenon: prefer input weatherId; else fall back to data['weather_id']; finally default to clear (800)
     if ($weatherId === null && isset($data['weather_id']) && is_numeric($data['weather_id'])) {
         $weatherId = (int)$data['weather_id'];
     }
-    // Fallback: clear sky
-    if ($weatherId === null) {
-        $weatherId = 800;
-    } else {
-        $weatherId = (int)$weatherId;
-    }
+    $weatherId = ($weatherId === null) ? 800 : (int)$weatherId;
 
+    // 7) Alerts: upstream alert adaptation layer should have standardized different data sources into alerts structure
     $alerts = [];
     if (isset($data['alerts']) && is_array($data['alerts'])) {
-        $alerts = $data['alerts']; // already normalized by caller
+        $alerts = $data['alerts'];
     }
 
-    // --- 4. Unit normalization: convert to °C & m/s ------------------------
+    // 8) Unit conversions: internally use °C and m/s (pollutants, uvi, pressure assumed in agreed units)
     if ($unit === 'imperial') {
-        // °F -> °C
         $T = ($T - 32) * 5 / 9;
         if ($dewPoint !== null)  $dewPoint  = ($dewPoint  - 32) * 5 / 9;
         if ($feelsLike !== null) $feelsLike = ($feelsLike - 32) * 5 / 9;
 
-        // mph -> m/s
         $wind = $wind / 2.237;
-        if ($windGust !== null)  $windGust  = $windGust / 2.237;
+        if ($windGust !== null)  $windGust = $windGust / 2.237;
     } elseif ($unit === 'standard') {
-        // K -> °C
         $T = $T - 273.15;
         if ($dewPoint !== null)  $dewPoint  = $dewPoint - 273.15;
         if ($feelsLike !== null) $feelsLike = $feelsLike - 273.15;
-        // wind already in m/s
     }
-    // metric: already in °C & m/s
 
-    // --- 5. Climate context (zone, factor, comfort temperature) ------------
+    // 9) Climate context: same temperature feels different by latitude/season; use comfortTemp as the "comfort anchor"
     $climateContext    = getClimateContext($latitude, $month);
     $climateAdjustment = $climateContext['factor'];
     $comfortTemp       = $climateContext['comfortTemp'];
 
-    // --- 6. Dynamic weights for comfort components -------------------------
+    // 10) Dynamic weights: slightly raise the weight of the dimension most affecting the current perception
     $weights = dynamicWeightAdjustment($T, $pm25, $uvi, $wind);
 
-    // --- 7. Thermal comfort scores -----------------------------------------
+    // 11) Thermal comfort: heat index / wind chill + humidity/wind effects + weather phenomenon penalties
     $heatIndex = calculateHeatIndex($T, $RH);
     $heatScore = calculateThermalComfort($T, $RH, $wind, $heatIndex, $weatherId, $comfortTemp, $dewPoint);
 
-    // Effective temperature for detail output
+    // 12) Perception diagnostic (effective_temp) for output: use heatIndex in warm seasons; windChill in cold seasons
     $windChill     = calculateWindChill($T, max($wind, $windGust ?? $wind));
     $effectiveTemp = ($T >= 20) ? $heatIndex : $windChill;
 
-    // --- 8. Other comfort components ---------------------------------------
+    // 13) Other comfort components: air/UV/pressure
     $airScore   = calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so2);
     $uvScore    = calculateUVScore($uvi);
     $pressScore = calculatePressureScore($press);
 
-    // Combine into comfort-only CEI
+    // 14) Comfort-layer aggregation: weighted sum + climate factor scaling
     $ceiComfort = $weights['heat']  * $heatScore
                 + $weights['air']   * $airScore
                 + $weights['uv']    * $uvScore
                 + $weights['press'] * $pressScore;
 
-    // Apply seasonal/climate factor
     $ceiComfort *= $climateAdjustment;
     $ceiComfort  = max(0, min(100, $ceiComfort));
 
-    // --- 9. Risk layer (temperature, weather phenomena, alerts) ------------
-    $tempRisk    = computeTemperatureRiskScore($T, $RH, $wind, $windGust, $dewPoint, $heatIndex);
-    $weatherRisk = computeWeatherRiskScore($weatherId, $windGust);
-    $alertsRisk  = computeAlertsRiskScore($alerts); // You can pass in $nowTs here. If you don't pass in $nowTs, the current Unix time will be used.
+    // 15) Risk layer: fuse "physical data" and "alert signals" by hazard buckets, produce risk_cap / hint / focus etc.
+    $riskLayer = computeRiskLayer([
+        'T' => $T, 'RH' => $RH, 'wind' => $wind, 'windGust' => $windGust,
+        'dewPoint' => $dewPoint, 'heatIndex' => $heatIndex,
+        'weatherId' => $weatherId,
+        'pm25' => $pm25, 'pm10' => $pm10, 'o3' => $o3, 'co' => $co, 'no2' => $no2, 'so2' => $so2,
+        'alerts' => $alerts,
+        'evalTs' => $evalTs,
+    ]);
 
-    // Overall risk: currently max of three dimensions
-    $riskScore = max($tempRisk['score'], $weatherRisk['score'], $alertsRisk['score']);
-    $riskScore = max(0, min(100, $riskScore));
+    // 16) Risk outputs: risk_score is intensity (0-100); risk_cap is capping upper bound (0-100, lower means more "danger")
+    $riskScore = (int)round($riskLayer['risk_score']);
+    $riskCap   = (float)$riskLayer['risk_cap'];
+    $riskHint  = (int)round($riskLayer['risk_hint_score']);
+    $riskFocus = (int)round($riskLayer['risk_focus_score']);
 
-    // Risk cap: upper bound of CEI allowed by safety
-    $riskCap = 100 - $riskScore;
-    $riskCap = max(0, min(100, $riskCap));
-
-    // --- 10. Final CEI and diagnostics -------------------------------------
+    // 17) Final CEI: take the minimum of comfort layer and risk cap
     $ceiFinal = min($ceiComfort, $riskCap);
     $ceiFinal = max(0, min(100, $ceiFinal));
 
+    // 18) main_effect: if capped by risk, main effect is risk; otherwise the lowest comfort component
     $componentScores = [
         'heat'     => $heatScore,
         'air'      => $airScore,
         'uv'       => $uvScore,
         'pressure' => $pressScore
     ];
-
-    // Main driver: if riskCap is binding, main_effect = 'risk',
-    // otherwise the lowest comfort component is considered the "short board".
     $minComponent = array_keys($componentScores, min($componentScores))[0];
     $mainEffect   = ($riskCap < $ceiComfort) ? 'risk' : $minComponent;
-
-    // Merge risk flags from all sub-modules
-    $detailFlags = array_values(array_unique(array_merge(
-        $tempRisk['flags'],
-        $weatherRisk['flags'],
-        $alertsRisk['flags']
-    )));
 
     return [
         'cei'   => round($ceiFinal),
@@ -239,6 +294,8 @@ function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
         'detail' => [
             'comfort_cei' => round($ceiComfort, 1),
             'risk_cap'    => round($riskCap, 1),
+            'risk_hint'   => $riskHint,
+            'risk_focus'  => $riskFocus,
             'main_effect' => $mainEffect,
 
             'climate' => $climateContext,
@@ -251,22 +308,30 @@ function computeCEI($unit, $data, $latitude, $month, $weatherId = null)
 
             'risk' => [
                 'overall'      => round($riskScore),
-                'from_temp'    => round($tempRisk['score']),
-                'from_weather' => round($weatherRisk['score']),
-                'from_alerts'  => round($alertsRisk['score']),
-                'flags'        => $detailFlags
+                'cap'          => round($riskCap, 1),
+                'hint'         => $riskHint,
+                'focus'        => $riskFocus,
+
+                'from_temp'    => (int)round($riskLayer['from_temp']),
+                'from_weather' => (int)round($riskLayer['from_weather']),
+                'from_alerts'  => (int)round($riskLayer['from_alerts']),
+
+                // User-readable "risk factors" (recommend front-end display; list of hazard names)
+                'factors'      => $riskLayer['factors'],
+
+                // Internal debug flags (recommend to show only in debug panels; not as "risk factors")
+                'debug_flags'  => $riskLayer['debug_flags'],
+
+                // Hazard bucket details: P/A/Q/R/Focus for each hazard (for explanation and visualization)
+                'hazards'      => $riskLayer['hazards'],
             ]
         ]
     ];
 }
 
 /**
- * Map CEI numeric value to a qualitative level string.
- *
- * NOTE: these boundaries are heuristic and can be calibrated in future versions.
- *
- * @param float|int $cei
- * @return string
+ * Map CEI numeric value to a level label.
+ * The thresholds are heuristic.
  */
 function getCEILevel($cei) {
     $cei = (float)$cei;
@@ -287,58 +352,42 @@ function getCEILevel($cei) {
 }
 
 /**
- * Estimate climate context from latitude and month:
- *  - Climate zone (equatorial / tropical / subtropical / temperate / cold_temperate / polar)
- *  - Seasonal factor (factor) used for light-scale adjustment
- *  - Baseline comfort temperature comfortTemp (°C)
+ * Estimate climate context:
+ * - zone: banding by |latitude| (symmetric N/S)
+ * - comfortTemp: "baseline comfort temperature" for the climate band (comfort anchor)
+ * - factor: mild scaling by season/climate (avoid overfitting the comfort layer to a single temperature zone)
  *
- * Notes:
- *  - Climate zone is determined by |latitude|, symmetric between hemispheres;
- *  - Season is determined using a “local month” (south hemisphere shifted by 6 months)
- *    to avoid mis-classifying cities like Brisbane.
- *
- * @param float $latitude Actual latitude
- * @param int   $month    Calendar month 1–12
- * @return array{zone:string,factor:float,comfortTemp:float}
+ * Note: months in the southern hemisphere are shifted by 6 months to avoid seasonal misjudgment.
  */
 function getClimateContext($latitude, $month)
 {
     $absLat = abs($latitude);
 
     if ($absLat < 10) {
-        $climateZone = 'equatorial';
-        $comfortTemp = 26;
+        $climateZone = 'equatorial'; $comfortTemp = 26;
     } elseif ($absLat < 23.5) {
-        $climateZone = 'tropical';
-        $comfortTemp = 25;
+        $climateZone = 'tropical'; $comfortTemp = 25;
     } elseif ($absLat < 35) {
-        $climateZone = 'subtropical';
-        $comfortTemp = 24;
+        $climateZone = 'subtropical'; $comfortTemp = 24;
     } elseif ($absLat < 55) {
-        $climateZone = 'temperate';
-        $comfortTemp = 22;
+        $climateZone = 'temperate'; $comfortTemp = 22;
     } elseif ($absLat < 66.5) {
-        $climateZone = 'cold_temperate';
-        $comfortTemp = 20;
+        $climateZone = 'cold_temperate'; $comfortTemp = 20;
     } else {
-        $climateZone = 'polar';
-        $comfortTemp = 18;
+        $climateZone = 'polar'; $comfortTemp = 18;
     }
 
-    // Map calendar month to “local month” (shift by 6 months in southern hemisphere)
     $monthNorm = ($month >= 1 && $month <= 12) ? (int)$month : 1;
     if ($latitude < 0) {
         $monthNorm = (($monthNorm + 5) % 12) + 1;
     }
 
-    // Light comfortTemp adjustment for local summer / winter
     if (in_array($monthNorm, [6, 7, 8], true)) {
         $comfortTemp += 1;
     } elseif (in_array($monthNorm, [12, 1, 2], true)) {
         $comfortTemp -= 1;
     }
 
-    // Seasonal factor (light scaling), uses the same hemisphere logic internally
     $factor = adjustForClimate($latitude, $month);
 
     return [
@@ -349,38 +398,22 @@ function getClimateContext($latitude, $month)
 }
 
 /**
- * Seasonal / climate factor used to lightly scale the comfort CEI.
- *
- * Design principles:
- *  - Use absolute latitude to assign climate zones (symmetric N/S);
- *  - Use “local month” (monthNorm) so that southern hemisphere seasons
- *    mirror northern hemisphere seasons;
- *  - Only apply mild scaling to edge/extreme climate zones to avoid
- *    over-steering the main CEI score.
- *
- * @param float $latitude Actual latitude
- * @param int   $month    Calendar month 1–12
- * @return float          Seasonal scaling factor
+ * Seasonal/climate factor (mild scaling):
+ * - Tropical regions feel more "muggy discomfort" in peak summer (factor slightly raised)
+ * - High-latitude cold regions feel more "harsh" in severe winter (factor slightly raised), slightly lowered in summer
+ * Goal is "light correction" without stealing the expression from the main models (comfort layer + risk layer).
  */
 function adjustForClimate($latitude, $month)
 {
     $absLat = abs($latitude);
 
-    if ($absLat < 10) {
-        $climateZone = 'equatorial';
-    } elseif ($absLat < 23.5) {
-        $climateZone = 'tropical';
-    } elseif ($absLat < 35) {
-        $climateZone = 'subtropical';
-    } elseif ($absLat < 55) {
-        $climateZone = 'temperate';
-    } elseif ($absLat < 66.5) {
-        $climateZone = 'cold_temperate';
-    } else {
-        $climateZone = 'polar';
-    }
+    if ($absLat < 10) $climateZone = 'equatorial';
+    elseif ($absLat < 23.5) $climateZone = 'tropical';
+    elseif ($absLat < 35) $climateZone = 'subtropical';
+    elseif ($absLat < 55) $climateZone = 'temperate';
+    elseif ($absLat < 66.5) $climateZone = 'cold_temperate';
+    else $climateZone = 'polar';
 
-    // Convert calendar month to “local month”
     $monthNorm = ($month >= 1 && $month <= 12) ? (int)$month : 1;
     if ($latitude < 0) {
         $monthNorm = (($monthNorm + 5) % 12) + 1;
@@ -388,40 +421,24 @@ function adjustForClimate($latitude, $month)
 
     $seasonFactor = 1.0;
 
-    // Local summer (months 6–8)
     if (in_array($monthNorm, [6, 7, 8], true)) {
-        if ($climateZone === 'tropical') {
-            $seasonFactor = 1.1;
-        } elseif (in_array($climateZone, ['polar', 'cold_temperate'], true)) {
-            $seasonFactor = 0.9;
-        }
+        if ($climateZone === 'tropical') $seasonFactor = 1.1;
+        elseif (in_array($climateZone, ['polar', 'cold_temperate'], true)) $seasonFactor = 0.9;
     }
-    // Local winter (months 12–2)
     elseif (in_array($monthNorm, [12, 1, 2], true)) {
-        if ($climateZone === 'tropical') {
-            $seasonFactor = 0.9;
-        } elseif (in_array($climateZone, ['polar', 'cold_temperate'], true)) {
-            $seasonFactor = 1.1;
-        }
+        if ($climateZone === 'tropical') $seasonFactor = 0.9;
+        elseif (in_array($climateZone, ['polar', 'cold_temperate'], true)) $seasonFactor = 1.1;
     }
 
     return $seasonFactor;
 }
 
 /**
- * Dynamic weights for comfort components (heat / air / UV / pressure).
- *
- * The weights are adjusted based on:
- *  - temperature (cold or hot conditions -> heat matters more)
- *  - PM2.5 (polluted -> air quality matters more)
- *  - UV (strong UV -> UV matters more)
- *  - wind (strong wind -> thermal comfort more important)
- *
- * @param float $T
- * @param float $pm25
- * @param float $uvi
- * @param float $wind
- * @return array
+ * Dynamic weights: slightly raise the weight of the more salient perception dimension now, then normalize.
+ * - Cold/Hot: raise thermal comfort weight (stronger perception dominance)
+ * - Strong wind: raise thermal comfort weight (wind chill / wind resistance)
+ * - High PM2.5: raise air weight (health/respiratory discomfort)
+ * - High UV: raise UV weight (sunburn risk/discomfort)
  */
 function dynamicWeightAdjustment($T, $pm25, $uvi, $wind) {
     $weights = [
@@ -431,60 +448,37 @@ function dynamicWeightAdjustment($T, $pm25, $uvi, $wind) {
         'press' => 0.1
     ];
 
-    // Cold or hot conditions: increase heat importance
-    if ($T > 30) {
-        $weights['heat'] = 0.5;
-    } elseif ($T < 15) {
-        $weights['heat'] = 0.6;
-    }
+    if ($T > 30) $weights['heat'] = 0.5;
+    elseif ($T < 15) $weights['heat'] = 0.6;
 
-    // Strong wind: thermal comfort becomes more critical
-    if ($wind > 8) {
-        $weights['heat'] += 0.05;
-    }
-    if ($wind > 12) {
-        $weights['heat'] += 0.05;
-    }
+    if ($wind > 8)  $weights['heat'] += 0.05;
+    if ($wind > 12) $weights['heat'] += 0.05;
 
-    // High PM2.5: air quality becomes more important
-    if ($pm25 > 35) {
-        $weights['air'] = 0.5;
-    }
+    if ($pm25 > 35) $weights['air'] = 0.5;
 
-    // Strong UV
-    if ($uvi > 8) {
-        $weights['uv'] = 0.2;
-    }
+    if ($uvi > 8) $weights['uv'] = 0.2;
 
-    // Floor weights and normalize to sum 1.0
     $minWeight = 0.05;
-    foreach ($weights as $key => $value) {
-        if ($value < $minWeight) {
-            $weights[$key] = $minWeight;
-        }
+    foreach ($weights as $k => $v) {
+        if ($v < $minWeight) $weights[$k] = $minWeight;
     }
 
     $sum = array_sum($weights);
-    foreach ($weights as $key => &$value) {
-        $value = $value / $sum;
+    foreach ($weights as $k => &$v) {
+        $v = $v / $sum;
     }
-    unset($value);
+    unset($v);
 
     return $weights;
 }
 
 /**
- * Heat Index (Steadman-like) in °C, using T(°C) and RH(%).
- * For T < 20°C the heat index is not meaningful; returns T.
- *
- * @param float $T
- * @param float $RH
- * @return float
+ * Heat Index (°C):
+ * - Primarily applicable to warm conditions (T >= 20°C)
+ * - Returns T at low temperatures to avoid unnecessary "heat-index noise"
  */
 function calculateHeatIndex($T, $RH) {
-    if ($T < 20) {
-        return $T;
-    }
+    if ($T < 20) return $T;
 
     $c1 = -8.78469475556;
     $c2 = 1.61139411;
@@ -508,21 +502,12 @@ function calculateHeatIndex($T, $RH) {
 }
 
 /**
- * Wind Chill calculation using the Canadian/US standard formula.
- *
- * Input:
- *  - T in °C
- *  - wind in m/s
- * Only applies when T < 10°C and wind > 1.3 m/s.
- *
- * @param float $T
- * @param float $wind
- * @return float
+ * Wind Chill (°C):
+ * - Effective only when T < 10°C and wind > 1.3 m/s
+ * - Otherwise returns original T
  */
 function calculateWindChill($T, $wind) {
-    if ($T >= 10 || $wind <= 1.3) {
-        return $T;
-    }
+    if ($T >= 10 || $wind <= 1.3) return $T;
 
     $wind_kmh = $wind * 3.6;
 
@@ -533,191 +518,102 @@ function calculateWindChill($T, $wind) {
 }
 
 /**
- * Temperature comfort curve as a function of deviation from comfort temperature.
- *
- * The curve is piecewise:
- *  - within ±2°C: full score
- *  - moderate deviations: gradually reduced
- *  - large deviations: floor at low values
- *
- * @param float $effectiveTemp
- * @param float $comfortTemp
- * @return float
+ * Temperature comfort curve (0-100):
+ * - Centered at comfortTemp; the larger the deviation, the more penalty
+ * - Piecewise for "interpretable, stable, easy-to-tune" behavior
  */
 function thermalComfortCurve($effectiveTemp, $comfortTemp)
 {
-    $delta    = $effectiveTemp - $comfortTemp;
+    $delta = $effectiveTemp - $comfortTemp;
     $absDelta = abs($delta);
 
-    if ($absDelta <= 2) {
-        return 100;
-    } elseif ($absDelta <= 5) {
-        return max(90, 100 - $absDelta * 2);
-    } elseif ($absDelta <= 15) {
-        return max(60, 90 - ($absDelta - 5) * 3);
-    } elseif ($absDelta <= 25) {
-        return max(30, 60 - ($absDelta - 15) * 3);
-    } else {
-        return max(5, 30 - ($absDelta - 25) * 2);
-    }
+    if ($absDelta <= 2) return 100;
+    if ($absDelta <= 5) return max(90, 100 - $absDelta * 2);
+    if ($absDelta <= 15) return max(60, 90 - ($absDelta - 5) * 3);
+    if ($absDelta <= 25) return max(30, 60 - ($absDelta - 15) * 3);
+    return max(5, 30 - ($absDelta - 25) * 2);
 }
 
 /**
- * Thermal comfort score combining:
- *  - temperature comfort around climate-specific comfortTemp
- *  - humidity comfort (around RH=50%)
- *  - wind comfort (strong wind is uncomfortable)
- *  - extra hot discomfort from high Heat Index and high dew point
- *  - weather-based penalty (rain, snow, storms, etc.)
- *
- * Returns 0–100.
- *
- * @param float      $T
- * @param float      $RH
- * @param float      $wind
- * @param float      $heatIndex
- * @param int        $weatherId
- * @param float      $comfortTemp
- * @param float|null $dewPoint
- * @return float
+ * Thermal comfort main (0-100):
+ * - Effective temperature: HeatIndex in warm seasons; WindChill in cold seasons
+ * - Humidity: most comfortable around 50%; extra muggy penalty when dew point is high
+ * - Wind: light breeze is best; strong wind reduces comfort
+ * - Weather phenomena: use weatherId to apply extra discomfort penalties (affect comfort only; not risk layer)
  */
 function calculateThermalComfort($T, $RH, $wind, $heatIndex, $weatherId, $comfortTemp, $dewPoint = null) {
-    // Effective temperature: Heat Index in warm conditions, Wind Chill in cold conditions
-    if ($T >= 20) {
-        $effectiveTemp = $heatIndex;
-    } else {
-        $effectiveTemp = calculateWindChill($T, $wind);
-    }
+    $effectiveTemp = ($T >= 20) ? $heatIndex : calculateWindChill($T, $wind);
 
     $tempComfort = thermalComfortCurve($effectiveTemp, $comfortTemp);
 
-    // Humidity comfort centered near 50% RH
     $humidityComfort = 100 - min(60, abs($RH - 50) * 1.2);
 
-    // Extra penalty for hot and humid conditions (high dew point)
     if ($dewPoint !== null && $T >= 20 && $dewPoint >= 24) {
         $extra = min(15, ($dewPoint - 23) * 1.5);
         $humidityComfort = max(20, $humidityComfort - $extra);
     }
 
-    // Wind comfort: calm to light wind is fine; strong wind reduces comfort
-    if ($wind <= 3) {
-        $windComfort = 100;
-    } else {
-        $windComfort = max(20, 100 - ($wind - 3) * 10);
-    }
+    $windComfort = ($wind <= 3) ? 100 : max(20, 100 - ($wind - 3) * 10);
 
-    // Additional hot discomfort when Heat Index is high
-    if ($heatIndex <= 27) {
-        $heatComfort = 100;
-    } else {
-        $heatComfort = max(20, 100 - ($heatIndex - 27) * 8);
-    }
+    $heatComfort = ($heatIndex <= 27) ? 100 : max(20, 100 - ($heatIndex - 27) * 8);
 
-    // Aggregate thermal comfort score
     $comfortScore = 0.5 * $tempComfort
                   + 0.25 * $humidityComfort
                   + 0.15 * $windComfort
                   + 0.10 * $heatComfort;
 
-    // Weather condition penalty (rain, snow, storms, fog, dust, etc.)
-    $weatherPenalty = getWeatherDiscomfortPenalty($weatherId);
-    $comfortScore  -= $weatherPenalty;
+    $comfortScore -= getWeatherDiscomfortPenalty($weatherId);
 
     return max(0, min(100, $comfortScore));
 }
 
 /**
- * Weather-based discomfort penalty using OpenWeather weather id.
- *
- * Returns penalty in [0, 25], where higher means more uncomfortable.
- * This affects only the comfort layer, not the risk layer.
- *
- * @param int $weatherId
- * @return int
+ * Weather discomfort penalty (0-25):
+ * - Affects the "comfort layer" only, expressing discomfort from rain/snow/thunder/fog/smog
+ * - Not used for risk capping (risk capping is handled by computeRiskLayer, focusing more on safety/health)
  */
 function getWeatherDiscomfortPenalty($weatherId) {
     $penalty = 0;
 
     if ($weatherId >= 200 && $weatherId < 300) {
-        // Thunderstorm
-        if (in_array($weatherId, [212, 221, 232], true)) {
-            $penalty = 20;
-        } else {
-            $penalty = 15;
-        }
+        $penalty = in_array($weatherId, [212, 221, 232], true) ? 20 : 15;
     } elseif ($weatherId >= 300 && $weatherId < 400) {
-        // Drizzle
         $penalty = 6;
     } elseif ($weatherId >= 500 && $weatherId < 600) {
-        // Rain
-        if (in_array($weatherId, [500, 520], true)) {
-            $penalty = 8;
-        } elseif (in_array($weatherId, [501, 521, 531], true)) {
-            $penalty = 12;
-        } elseif (in_array($weatherId, [502, 503, 504, 522], true)) {
-            $penalty = 16;
-        } elseif ($weatherId === 511) {
-            $penalty = 20;
-        } else {
-            $penalty = 12;
-        }
+        if (in_array($weatherId, [500, 520], true)) $penalty = 8;
+        elseif (in_array($weatherId, [501, 521, 531], true)) $penalty = 12;
+        elseif (in_array($weatherId, [502, 503, 504, 522], true)) $penalty = 16;
+        elseif ($weatherId === 511) $penalty = 20;
+        else $penalty = 12;
     } elseif ($weatherId >= 600 && $weatherId < 700) {
-        // Snow
-        if (in_array($weatherId, [600, 615, 620], true)) {
-            $penalty = 12;
-        } elseif (in_array($weatherId, [601, 612, 621], true)) {
-            $penalty = 16;
-        } else {
-            $penalty = 20;
-        }
+        if (in_array($weatherId, [600, 615, 620], true)) $penalty = 12;
+        elseif (in_array($weatherId, [601, 612, 621], true)) $penalty = 16;
+        else $penalty = 20;
     } elseif ($weatherId >= 700 && $weatherId < 800) {
-        // Atmosphere (mist, smoke, haze, fog, dust, sand, etc.)
-        if (in_array($weatherId, [701, 711, 721, 741], true)) {
-            $penalty = 10;
-        } elseif (in_array($weatherId, [731, 751, 761, 762, 771], true)) {
-            $penalty = 18;
-        } elseif ($weatherId === 781) {
-            $penalty = 25;
-        } else {
-            $penalty = 12;
-        }
+        if (in_array($weatherId, [701, 711, 721, 741], true)) $penalty = 10;
+        elseif (in_array($weatherId, [731, 751, 761, 762, 771], true)) $penalty = 18;
+        elseif ($weatherId === 781) $penalty = 25;
+        else $penalty = 12;
     } elseif ($weatherId === 800) {
-        // Clear sky
         $penalty = 0;
     } elseif ($weatherId >= 801 && $weatherId <= 804) {
-        // Clouds
-        if ($weatherId === 801) {
-            $penalty = 1;
-        } elseif ($weatherId === 802) {
-            $penalty = 2;
-        } elseif ($weatherId === 803) {
-            $penalty = 4;
-        } elseif ($weatherId === 804) {
-            $penalty = 6;
-        }
+        if ($weatherId === 801) $penalty = 1;
+        elseif ($weatherId === 802) $penalty = 2;
+        elseif ($weatherId === 803) $penalty = 4;
+        elseif ($weatherId === 804) $penalty = 6;
     }
 
     return $penalty;
 }
 
 /**
- * Air quality comfort score based on multiple pollutants.
- *
- * Returns the minimum (worst) score among all pollutants.
- *
- * @param float $pm25
- * @param float $pm10
- * @param float $o3
- * @param float $co
- * @param float $no2
- * @param float $so2
- * @return float
+ * Air quality comfort score (0-100):
+ * - Map each pollutant to a score
+ * - Take the worst item as the overall score (bottleneck effect)
  */
 function calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so2) {
     $scores = [];
 
-    // PM2.5
     $scores['pm25'] = calculatePollutantScore($pm25, [
         [15, 100],
         [25, 90],
@@ -726,7 +622,6 @@ function calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so
         [75, 50]
     ]);
 
-    // PM10
     $scores['pm10'] = calculatePollutantScore($pm10, [
         [15, 100],
         [45, 80],
@@ -735,7 +630,6 @@ function calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so
         [120, 20]
     ]);
 
-    // O3 (µg/m³)
     $scores['o3'] = calculatePollutantScore($o3, [
         [60, 100],
         [100, 80],
@@ -744,7 +638,7 @@ function calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so
         [200, 20]
     ]);
 
-    // CO: convert µg/m³ to mg/m³
+    // CO: input is µg/m³; convert to mg/m³ for threshold scoring
     $co_mg = $co / 1000.0;
     $scores['co'] = calculatePollutantScore($co_mg, [
         [1, 100],
@@ -754,7 +648,6 @@ function calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so
         [15, 20]
     ]);
 
-    // NO2
     $scores['no2'] = calculatePollutantScore($no2, [
         [10, 100],
         [25, 80],
@@ -763,7 +656,6 @@ function calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so
         [80, 20]
     ]);
 
-    // SO2
     $scores['so2'] = calculatePollutantScore($so2, [
         [20, 100],
         [40, 80],
@@ -772,53 +664,35 @@ function calculateAirQualityScoreInternational($pm25, $pm10, $o3, $co, $no2, $so
         [100, 20]
     ]);
 
-    // Overall air comfort is limited by the worst pollutant
     return min($scores);
 }
 
 /**
- * Generic pollutant scoring helper.
- *
- * @param float $concentration
- * @param array $thresholds Each item: [limit, score]
- * @return float
+ * Generic pollutant score mapping (piecewise thresholds).
  */
 function calculatePollutantScore($concentration, $thresholds) {
     foreach ($thresholds as $threshold) {
-        if ($concentration <= $threshold[0]) {
-            return $threshold[1];
-        }
+        if ($concentration <= $threshold[0]) return $threshold[1];
     }
     return 10;
 }
 
 /**
- * UV comfort score based on UV index.
- *
- * @param float $uvi
- * @return float
+ * UV comfort score (0-100):
+ * - Higher UVI means less comfort (and sunburn risk exists)
  */
 function calculateUVScore($uvi) {
-    if ($uvi <= 2) {
-        return 100;
-    }
-    if ($uvi <= 5) {
-        return 85;
-    }
-    if ($uvi <= 7) {
-        return 70;
-    }
-    if ($uvi <= 10) {
-        return 55;
-    }
+    if ($uvi <= 2) return 100;
+    if ($uvi <= 5) return 85;
+    if ($uvi <= 7) return 70;
+    if ($uvi <= 10) return 55;
     return 40;
 }
 
 /**
- * Pressure comfort score around standard sea level pressure (1013.25 hPa).
- *
- * @param float $pressure
- * @return float
+ * Pressure comfort score (0-100):
+ * - Base at 1013.25 hPa
+ * - Larger deviation means less comfort, but keep a lower bound
  */
 function calculatePressureScore($pressure) {
     $standard  = 1013.25;
@@ -830,420 +704,721 @@ function calculatePressureScore($pressure) {
     if ($deviation <= 20) return 70;
     if ($deviation <= 25) return 60;
 
-    // Beyond 25 hPa difference, decay quickly but keep a floor at 40
     return max(40, 100 - $deviation * 2);
 }
 
 /**
- * Compute risk score from temperature, humidity, wind, gusts and dew point.
+ * Risk-layer main (Hazard Bucket Fusion):
+ * Inputs ctx:
+ * - Physical perception data: T/RH/wind/windGust/dewPoint/heatIndex/weatherId
+ * - Health data: pm25/pm10/o3/co/no2/so2
+ * - Official alerts: alerts (already standardized)
+ * - Evaluation moment: evalTs (for forecast)
  *
- * This represents potential health/survival risk in extreme cold/heat,
- * not just discomfort.
- *
- * @param float      $T
- * @param float      $RH
- * @param float      $wind
- * @param float|null $windGust
- * @param float|null $dewPoint
- * @param float|null $heatIndex
- * @return array{score:int,flags:string[]}
+ * Outputs:
+ * - risk_score: overall risk intensity (0-100)
+ * - risk_cap: risk capping upper bound (0-100, lower means more dangerous)
+ * - risk_hint_score: risk hint score (more sensitive)
+ * - risk_focus_score: focus score (for "key attention")
+ * - hazards: each hazard's P/A/Q/R/Focus
+ * - factors: user-readable risk factors (recommend front-end display)
+ * - debug_flags: internal debug flags
  */
-function computeTemperatureRiskScore($T, $RH, $wind, $windGust = null, $dewPoint = null, $heatIndex = null)
+function computeRiskLayer(array $ctx): array
 {
-    $flags = [];
+    $T         = (float)$ctx['T'];
+    $RH        = (float)$ctx['RH'];
+    $wind      = (float)$ctx['wind'];
+    $windGust  = $ctx['windGust'];
+    $dewPoint  = $ctx['dewPoint'];
+    $heatIndex = (float)$ctx['heatIndex'];
+    $weatherId = (int)$ctx['weatherId'];
+    $evalTs    = (int)$ctx['evalTs'];
 
-    // Use gust if stronger than mean wind speed
-    $vEff  = $wind;
-    if ($windGust !== null && is_numeric($windGust) && $windGust > $vEff) {
-        $vEff = $windGust;
+    $pm25 = (float)$ctx['pm25'];
+    $pm10 = (float)$ctx['pm10'];
+    $o3   = (float)$ctx['o3'];
+    $co   = (float)$ctx['co'];
+    $no2  = (float)$ctx['no2'];
+    $so2  = (float)$ctx['so2'];
+
+    $alerts = $ctx['alerts'];
+
+    $debug = [];
+    $debug[] = 'risk_hazard_bucket';
+
+    // 1) Physical-side risk (P): temperature extremes, weather phenomena, air health risks
+    $tempRisk    = computeTemperatureRiskScore($T, $RH, $wind, $windGust, $dewPoint, $heatIndex);
+    $weatherRisk = computeWeatherRiskScore($weatherId, $windGust, $T, $wind);
+    $airHealth   = computeAirHealthRisk($pm25, $pm10, $o3, $co, $no2, $so2);
+
+    // 2) Construct P (0-1): bucketed by hazard
+    $P = [];
+    $P['extreme_cold'] = clamp01($tempRisk['cold_score'] / 100.0);
+    $P['extreme_heat'] = clamp01($tempRisk['heat_score'] / 100.0);
+
+    foreach ($weatherRisk['hazards'] as $hz => $r01) {
+        $P[$hz] = max($P[$hz] ?? 0.0, clamp01($r01));
     }
 
-    $windChill = calculateWindChill($T, $vEff);
+    $P['air_quality'] = max($P['air_quality'] ?? 0.0, clamp01($airHealth['risk_01']));
 
-    // Cold risk thresholds (wind chill based)
-    $coldRisk = 0;
-    if ($windChill <= -45) {
-        $coldRisk = 95;
-        $flags[]  = 'temp_extreme_cold_45';
-    } elseif ($windChill <= -40) {
-        $coldRisk = 90;
-        $flags[]  = 'temp_extreme_cold_40';
-    } elseif ($windChill <= -35) {
-        $coldRisk = 80;
-        $flags[]  = 'temp_extreme_cold_35';
-    } elseif ($windChill <= -30) {
-        $coldRisk = 65;
-        $flags[]  = 'temp_very_cold_30';
-    } elseif ($windChill <= -25) {
-        $coldRisk = 50;
-        $flags[]  = 'temp_cold_25';
+    // 3) Alert-side signals (A/Q): A=strength(0-1), Q=credibility/hit-rate(0-1)
+    $alertSignals = computeAlertHazardSignals($alerts, $evalTs);
+    $A = $alertSignals['A'];
+    $Q = $alertSignals['Q'];
+
+    // 4) Fusion: R = P + Q * max(0, A - P)
+    //    Explanation: alerts only "fill the gap" when stronger than physical signals, avoiding double penalty
+    $hazards = [];
+    $betaFocus = 0.35;
+
+    $hzKeys = array_values(array_unique(array_merge(array_keys($P), array_keys($A))));
+    sort($hzKeys);
+
+    foreach ($hzKeys as $hz) {
+        $p = (float)($P[$hz] ?? 0.0);
+        $a = (float)($A[$hz] ?? 0.0);
+        $q = (float)($Q[$hz] ?? 0.0);
+
+        $r = $p + $q * max(0.0, ($a - $p));
+
+        // 5) Borderline correction: when physical is "borderline" and alerts are strong and credible, allow a slight increase of R
+        //    Purpose: enhance credible vigilance for low-temperature borderline scenarios like icy roads, snow, wind (but still not hard maxing)
+        if ($p >= 0.35 && $p <= 0.65 && $a >= 0.75 && $q >= 0.60) {
+            $r += 0.05 * ($a - $p);
+            $debug[] = 'borderline_boost_' . $hz;
+        }
+
+        $r = clamp01($r);
+
+        // 6) Focus: more for reminders, emphasizing "attention-worthy if either side is high"
+        $focus = max($p, $a) + $betaFocus * min($p, $a) * $q;
+        $focus = clamp01($focus);
+
+        $hazards[$hz] = [
+            'P'     => round($p, 3),
+            'A'     => round($a, 3),
+            'Q'     => round($q, 3),
+            'R'     => round($r, 3),
+            'Focus' => round($focus, 3),
+            'source' => [
+                'physical' => ($p > 0.001),
+                'alert'    => ($a > 0.001),
+            ]
+        ];
     }
 
-    // Heat risk thresholds (heat index based)
-    if ($heatIndex === null) {
-        $heatIndex = calculateHeatIndex($T, $RH);
-    }
+    // 7) Overall aggregation: Noisy-OR (won't "linearly explode" from a single item, better for coexisting risks)
+    $impactW = getHazardImpactWeights();
+    $R_overall     = combineHazardsNoisyOR($hazards, $impactW, 'R');
+    $Focus_overall = combineHazardsNoisyOR($hazards, $impactW, 'Focus');
 
-    // High dew point aggravates heat risk
-    if ($dewPoint !== null && $dewPoint >= 26) {
-        $heatIndex += ($dewPoint >= 29) ? 4 : 2;
-    }
+    // 8) risk_score: risk intensity (higher is more dangerous); risk_cap: capping upper bound (lower is more dangerous)
+    $risk_score = 100.0 * $R_overall;
+    $risk_cap   = mapOverallRiskToCap($R_overall);
 
-    $heatRisk = 0;
-    if ($heatIndex >= 52) {
-        $heatRisk = 90;
-        $flags[]  = 'temp_extreme_heat_52';
-    } elseif ($heatIndex >= 41) {
-        $heatRisk = 80;
-        $flags[]  = 'temp_extreme_heat_41';
-    } elseif ($heatIndex >= 35) {
-        $heatRisk = 60;
-        $flags[]  = 'temp_heat_35';
-    } elseif ($heatIndex >= 32) {
-        $heatRisk = 40;
-        $flags[]  = 'temp_heat_32';
-    }
+    // 9) risk_hint: hint score (more sensitive), aggregated using max(P, A) (more like a "reminder system")
+    $H_overall = computeHintOverall($hazards, $impactW);
+    $risk_hint_score = 100.0 * $H_overall;
 
-    $score = max($coldRisk, $heatRisk);
+    // 10) factors: user-readable risk factors (hazard list); recommend front-end to display these as "risk factors"
+    $factors = pickUserFactors($hazards);
+
+    // 11) Compatibility fields: useful for existing front-end, or explaining "where the risk mainly comes from"
+    $fromTemp = 100.0 * max($hazards['extreme_cold']['R'] ?? 0.0, $hazards['extreme_heat']['R'] ?? 0.0);
+
+    $fromWeather = 100.0 * max(
+        $hazards['wind']['R'] ?? 0.0,
+        $hazards['snow_ice']['R'] ?? 0.0,
+        $hazards['heavy_rain']['R'] ?? 0.0,
+        $hazards['thunderstorm']['R'] ?? 0.0,
+        $hazards['fog']['R'] ?? 0.0,
+        $hazards['dust_sand']['R'] ?? 0.0,
+        $hazards['tornado']['R'] ?? 0.0,
+        0.0
+    );
+
+    $fromAlerts = 100.0 * maxAlertContribution($hazards);
+
+    // 12) debug_flags: internal debug flag set (do not present as "risk factors")
+    $debug = array_values(array_unique(array_merge(
+        $debug,
+        $tempRisk['debug_flags'],
+        $weatherRisk['debug_flags'],
+        $alertSignals['debug_flags']
+    )));
 
     return [
-        'score' => max(0, min(100, $score)),
-        'flags' => $flags
+        'risk_score'       => round($risk_score, 1),
+        'risk_cap'         => round($risk_cap, 1),
+        'risk_hint_score'  => round($risk_hint_score, 1),
+        'risk_focus_score' => round(100.0 * $Focus_overall, 1),
+
+        'from_temp'        => round($fromTemp, 1),
+        'from_weather'     => round($fromWeather, 1),
+        'from_alerts'      => round($fromAlerts, 1),
+
+        'factors'          => $factors,
+        'debug_flags'      => $debug,
+        'hazards'          => $hazards,
     ];
 }
 
 /**
- * Compute risk score from weather phenomena and strong wind gusts.
+ * Compute per-hazard signals from alerts:
+ * - A: alert strength (0-1): hazard_base * severity * timeFactor
+ * - Q: alert credibility/hit-rate (0-1): timeFactor * certainty * urgency * area
  *
- * Uses OpenWeather weather id and gust thresholds to estimate
- * potential hazard (storms, heavy rain, snow, fog, dust, tornado, etc).
- *
- * @param int        $weatherId
- * @param float|null $windGust
- * @return array{score:int,flags:string[]}
+ * Explanation:
+ * - A expresses "how strong the alert itself is"
+ * - Q expresses "whether this alert is credible and applicable at the current evaluation time"
+ * - Whether it affects capping is determined by the fusion formula R (only fills gaps, no repeated penalties)
  */
-function computeWeatherRiskScore($weatherId, $windGust = null)
+function computeAlertHazardSignals(array $alerts, int $evalTs): array
 {
-    $score = 0;
-    $flags = [];
+    $A = [];
+    $Q = [];
+    $debug = [];
 
-    if ($weatherId >= 200 && $weatherId < 300) {
-        // Thunderstorm
-        if (in_array($weatherId, [212, 221, 232], true)) {
-            $score = 70;
-            $flags[] = 'wx_thunderstorm_heavy';
-        } else {
-            $score = 60;
-            $flags[] = 'wx_thunderstorm';
-        }
-    }
-    elseif ($weatherId >= 300 && $weatherId < 400) {
-        // Drizzle
-        $score = 20;
-        $flags[] = 'wx_drizzle';
-    }
-    elseif ($weatherId >= 500 && $weatherId < 600) {
-        // Rain
-        if (in_array($weatherId, [500, 520], true)) {
-            $score = 30;
-            $flags[] = 'wx_rain_light';
-        } elseif (in_array($weatherId, [501, 521, 531], true)) {
-            $score = 50;
-            $flags[] = 'wx_rain_moderate';
-        } elseif (in_array($weatherId, [502, 503, 504, 522], true)) {
-            $score = 60;
-            $flags[] = 'wx_rain_heavy';
-        } elseif ($weatherId === 511) {
-            $score = 70;
-            $flags[] = 'wx_freezing_rain';
-        }
-    }
-    elseif ($weatherId >= 600 && $weatherId < 700) {
-        // Snow
-        if (in_array($weatherId, [600, 615, 620], true)) {
-            $score = 40;
-            $flags[] = 'wx_snow_light';
-        } elseif (in_array($weatherId, [601, 612, 621], true)) {
-            $score = 55;
-            $flags[] = 'wx_snow_moderate';
-        } else {
-            $score = 65;
-            $flags[] = 'wx_snow_heavy';
-        }
-    }
-    elseif ($weatherId >= 700 && $weatherId < 800) {
-        // Atmosphere group
-        if (in_array($weatherId, [701, 711, 721, 741], true)) {
-            $score = 35;
-            $flags[] = 'wx_fog_mist';
-        } elseif (in_array($weatherId, [731, 751, 761, 762, 771], true)) {
-            $score = 55;
-            $flags[] = 'wx_dust_sand_squall';
-        } elseif ($weatherId === 781) {
-            $score = 95;
-            $flags[] = 'wx_tornado';
-        }
-    }
-
-    // Additional risk from very strong gusts (Beaufort ~7+)
-    if ($windGust !== null && is_numeric($windGust)) {
-        if ($windGust >= 25) {
-            $score = max($score, 70);
-            $flags[] = 'wind_gust_25';
-        } elseif ($windGust >= 20) {
-            $score = max($score, 60);
-            $flags[] = 'wind_gust_20';
-        } elseif ($windGust >= 15) {
-            $score = max($score, 45);
-            $flags[] = 'wind_gust_15';
-        }
-    }
-
-    return [
-        'score' => max(0, min(100, $score)),
-        'flags' => $flags
-    ];
-}
-
-/**
- * Risk scoring based on official weather alerts.
- *
- * Alerts must first be normalized by an adapter layer into a unified, source-agnostic structure:
- *
- *  Each alert is an associative array:
- *  [
- *    'event'          => string|null,   // Title (optional)
- *    'description'    => string|null,   // Description (optional)
- *    'tags'           => string[],      // 'hazard:*', 'severity:*', 'color:*', 'provider:*'
- *    'severity'       => string|null,   // 'minor'|'moderate'|'severe'|'extreme'|'unknown'
- *    'severity_score' => float|null,    // (optional) external model output, continuous severity in [0,1]
- *    'code'           => int|null,      // Provider-specific alert code (e.g. QWeather)
- *    'start_ts'       => int|null,      // Alert start time (UTC seconds)
- *    'end_ts'         => int|null       // Alert end time (UTC seconds)
- *  ]
- *
- * All time-related logic is handled inside this function:
- *  - Expired alerts (now_ts much larger than end_ts) have 0 risk;
- *  - Active alerts use full weight;
- *  - Future alerts are decayed according to lead time before start.
- *
- * @param array      $alerts  Normalized alert array
- * @param int|null   $nowTs   Current time (UTC seconds). If null, time() is used.
- *
- * @return array{score:int,flags:string[]}
- */
-function computeAlertsRiskScore(array $alerts, ?int $nowTs = null)
-{
     if (empty($alerts)) {
-        return ['score' => 0, 'flags' => []];
+        return ['A' => [], 'Q' => [], 'debug_flags' => ['alerts_empty']];
     }
 
-    if ($nowTs === null) {
-        $nowTs = time();
-    }
-
-    // Base risk for each hazard type (roughly corresponds to a “medium-level” active alert)
-    $hazardBaseRisk = [
-        'extreme_cold'     => 85,
-        'extreme_heat'     => 80,
-        'thunderstorm'     => 65,
-        'heavy_rain'       => 60,
-        'snow_ice'         => 70,
-        'wind'             => 60,
-        'tropical_cyclone' => 90,
-        'fog'              => 40,
-        'dust_sand'        => 50,
-        'fire'             => 70,
-        'flood'            => 80,
-        'coastal'          => 65,
-        'air_quality'      => 60,
-        'avalanche'        => 90,
-        'geohazard'        => 80,
-        'other'            => 40,
-    ];
-
-    $overallScore = 0;
-    $allFlags     = [];
+    $debug[] = 'alerts_present';
 
     foreach ($alerts as $alert) {
-        if (!is_array($alert)) {
-            continue;
-        }
+        if (!is_array($alert)) continue;
 
-        $tags          = isset($alert['tags']) && is_array($alert['tags']) ? $alert['tags'] : [];
-        $hazards       = extractHazardsFromTags($tags);
+        // tags: should be unified by the adaptation layer (hazard:*, severity:*, certainty:*, urgency:*, area:* etc.)
+        $tags = (isset($alert['tags']) && is_array($alert['tags'])) ? $alert['tags'] : [];
+        $hazards = extractHazardsFromTags($tags);
+        if (empty($hazards)) $hazards = ['other'];
+
         $severity      = isset($alert['severity']) ? (string)$alert['severity'] : null;
-        $severityScore = isset($alert['severity_score']) && is_numeric($alert['severity_score'])
-                       ? (float)$alert['severity_score'] : null;
+        $severityScore = (isset($alert['severity_score']) && is_numeric($alert['severity_score']))
+            ? (float)$alert['severity_score'] : null;
 
-        $startTs = isset($alert['start_ts']) && is_numeric($alert['start_ts']) ? (int)$alert['start_ts'] : null;
-        $endTs   = isset($alert['end_ts'])   && is_numeric($alert['end_ts'])   ? (int)$alert['end_ts']   : null;
+        // start/end: UTC seconds; use evalTs to judge phase for forecast
+        $startTs = (isset($alert['start_ts']) && is_numeric($alert['start_ts'])) ? (int)$alert['start_ts'] : null;
+        $endTs   = (isset($alert['end_ts'])   && is_numeric($alert['end_ts']))   ? (int)$alert['end_ts']   : null;
 
-        if (empty($hazards)) {
-            $hazards = ['other'];
-        }
+        $timeInfo = mapAlertTimeFactor($startTs, $endTs, $evalTs);
+        $tFactor  = $timeInfo['factor'];
+        $phase    = $timeInfo['phase'];
 
-        // 1) Time factor: future / active / expired
-        $timeInfo   = mapAlertTimeFactor($startTs, $endTs, $nowTs);
-        $timeFactor = $timeInfo['factor'];
-
-        if ($timeFactor <= 0.0) {
-            $allFlags[] = 'phase_past';
+        // Expired: skip directly
+        if ($tFactor <= 0.0) {
+            $debug[] = 'phase_past';
             continue;
         }
 
-        // 2) Severity factor
-        $sevFactor = mapSeverityToFactor($severity, $severityScore);
+        // Map severity to 0-1 (for better fusion with P/Q)
+        $sev01 = mapSeverityTo01($severity, $severityScore);
 
-        foreach ($hazards as $h) {
-            if (!isset($hazardBaseRisk[$h])) {
-                $h = 'other';
-            }
+        // Credibility/hit-rate factors: come from tags (use default when missing)
+        $certainty01 = extractTagFactor($tags, 'certainty', [
+            'observed' => 1.00, 'likely' => 0.85, 'possible' => 0.70, 'unknown' => 0.80,
+        ], 0.80);
 
-            $base = $hazardBaseRisk[$h];
+        $urgency01 = extractTagFactor($tags, 'urgency', [
+            'immediate' => 1.00, 'expected' => 0.85, 'future' => 0.70, 'past' => 0.00, 'unknown' => 0.80,
+        ], 0.80);
 
-            // 3) Combined risk = base × severity factor × time factor
-            $risk = (int)round($base * $sevFactor * $timeFactor);
-            $risk = max(0, min(100, $risk));
+        $area01 = extractTagFactor($tags, 'area', [
+            'point' => 1.00, 'local' => 0.90, 'city' => 0.80, 'regional' => 0.70,
+            'province' => 0.60, 'national' => 0.50, 'marine' => 0.65, 'unknown' => 0.75,
+        ], 0.75);
 
-            $overallScore = max($overallScore, $risk);
+        // Q: composite credibility (closer to 1 is more credible)
+        $q = clamp01($tFactor * $certainty01 * $urgency01 * $area01);
 
-            $allFlags[] = 'alert_' . $h;
+        // Baseline strength (0-1) for each hazard, roughly corresponding to "moderate severity + active phase"
+        $hazardBase = getAlertHazardBase01();
 
-            if ($severity !== null) {
-                $allFlags[] = 'severity_' . cei_strlower_safe($severity);
-            }
-            if ($timeInfo['phase'] !== '') {
-                $allFlags[] = 'phase_' . $timeInfo['phase'];
-            }
+        foreach ($hazards as $hz) {
+            $base = $hazardBase[$hz] ?? $hazardBase['other'];
+
+            // A: alert strength (use tFactor lightly to avoid too strong signals during lead phase)
+            $a = $base * $sev01 * (0.65 + 0.35 * $tFactor);
+            $a = clamp01($a);
+
+            // Aggregation: for multiple alerts of the same hazard, take the max (strongest one dominates)
+            $A[$hz] = max($A[$hz] ?? 0.0, $a);
+            $Q[$hz] = max($Q[$hz] ?? 0.0, $q);
+
+            $debug[] = 'alert_' . $hz;
+            if ($severity !== null) $debug[] = 'severity_' . cei_strlower_safe($severity);
+            $debug[] = 'phase_' . $phase;
         }
     }
 
-    $allFlags = array_values(array_unique($allFlags));
-
-    return [
-        'score' => $overallScore,
-        'flags' => $allFlags
-    ];
+    $debug = array_values(array_unique($debug));
+    return ['A' => $A, 'Q' => $Q, 'debug_flags' => $debug];
 }
 
 /**
- * Extract a list of hazard types from the tags array.
- *
- * Example:
- *   ['hazard:wind', 'hazard:flood', 'severity:severe', 'provider:qweather']
- * Returns:
- *   ['wind', 'flood']
- *
- * @param array $tags
- * @return array
+ * Alert time-phase mapping:
+ * - past: ended over 1 hour ago, factor=0
+ * - lead: not started yet, decay by lead time (further means weaker)
+ * - active: in effect, factor=1
+ * - unknown_time: no time info, give a moderately conservative factor
  */
-function extractHazardsFromTags(array $tags): array
+function mapAlertTimeFactor(?int $startTs, ?int $endTs, int $evalTs): array
 {
-    $hazards = [];
-
-    foreach ($tags as $tag) {
-        if (!is_string($tag)) {
-            continue;
-        }
-        if (strpos($tag, 'hazard:') === 0) {
-            $h = substr($tag, 7);
-            if ($h !== '') {
-                $hazards[] = $h;
-            }
-        }
-    }
-
-    return array_values(array_unique($hazards));
-}
-
-/**
- * Map alert severity (text or model score) to a scaling factor.
- *
- * Logic:
- *  - If severity_score ∈ [0,1] is provided, linearly map it to [0.7, 1.4]
- *  - Otherwise map severity 'minor'/'moderate'/'severe'/'extreme' to fixed factors
- *
- * @param string|null $severity
- * @param float|null  $severityScore
- * @return float
- */
-function mapSeverityToFactor(?string $severity, ?float $severityScore = null): float
-{
-    if ($severityScore !== null) {
-        $x = max(0.0, min(1.0, $severityScore));
-        return 0.7 + 0.7 * $x;
-    }
-
-    if ($severity === null) {
-        return 1.0;
-    }
-
-    switch (cei_strlower_safe(trim($severity))) {
-        case 'minor':
-            return 0.7;
-        case 'moderate':
-            return 1.0;
-        case 'severe':
-            return 1.2;
-        case 'extreme':
-            return 1.4;
-        case 'unknown':
-        default:
-            return 1.0;
-    }
-}
-
-/**
- * Time factor mapping:
- *
- * - If the alert has clearly ended and more than 1 hour has passed: factor = 0, phase = 'past'
- * - If it is currently active: factor = 1.0, phase = 'active'
- * - If it has not started yet: decay according to lead time, keeping some constraint from future alerts but weaker than active ones
- *
- * @param int|null $startTs  Alert start time (UTC seconds)
- * @param int|null $endTs    Alert end time (UTC seconds)
- * @param int      $nowTs    Current time (UTC seconds)
- * @return array{factor:float,phase:string}
- */
-function mapAlertTimeFactor(?int $startTs, ?int $endTs, int $nowTs): array
-{
-    // Completely unknown timing: treat as “current/near-term”, factor = 1.0, but mark as unknown_time
     if ($startTs === null && $endTs === null) {
-        return ['factor' => 1.0, 'phase' => 'unknown_time'];
+        return ['factor' => 0.85, 'phase' => 'unknown_time'];
     }
 
-    // Has an end time and is clearly over (with a 1-hour buffer)
-    if ($endTs !== null && $nowTs > $endTs + 3600) {
+    if ($endTs !== null && $evalTs > $endTs + 3600) {
         return ['factor' => 0.0, 'phase' => 'past'];
     }
 
-    // If start time exists and now is before it → future alert
-    if ($startTs !== null && $nowTs < $startTs) {
-        $leadHours = ($startTs - $nowTs) / 3600.0;
+    if ($startTs !== null && $evalTs < $startTs) {
+        $leadHours = ($startTs - $evalTs) / 3600.0;
 
-        if ($leadHours <= 3) {
-            return ['factor' => 0.8, 'phase' => 'lead_0_3h'];
-        } elseif ($leadHours <= 12) {
-            return ['factor' => 0.6, 'phase' => 'lead_3_12h'];
-        } elseif ($leadHours <= 24) {
-            return ['factor' => 0.45, 'phase' => 'lead_12_24h'];
-        } elseif ($leadHours <= 48) {
-            return ['factor' => 0.3, 'phase' => 'lead_24_48h'];
-        } else {
-            return ['factor' => 0.2, 'phase' => 'lead_gt_48h'];
-        }
+        if ($leadHours <= 3)   return ['factor' => 0.85, 'phase' => 'lead_0_3h'];
+        if ($leadHours <= 12)  return ['factor' => 0.65, 'phase' => 'lead_3_12h'];
+        if ($leadHours <= 24)  return ['factor' => 0.50, 'phase' => 'lead_12_24h'];
+        if ($leadHours <= 48)  return ['factor' => 0.35, 'phase' => 'lead_24_48h'];
+        return ['factor' => 0.25, 'phase' => 'lead_gt_48h'];
     }
 
-    // Other cases (already started but not ended / only end time and not yet expired / only start time and now >= start)
     return ['factor' => 1.0, 'phase' => 'active'];
 }
 
 /**
- * String lowercase helper.
+ * Map severity to [0,1]:
+ * - If severity_score ∈ [0,1]: finer granularity, linearly map to [0.45, 1.0]
+ * - Else use discrete severity: minor/moderate/severe/extreme
+ */
+function mapSeverityTo01(?string $severity, ?float $severityScore = null): float
+{
+    if ($severityScore !== null) {
+        $x = clamp01((float)$severityScore);
+        return 0.45 + 0.55 * $x;
+    }
+
+    if ($severity === null) return 0.60;
+
+    switch (cei_strlower_safe(trim($severity))) {
+        case 'minor':    return 0.45;
+        case 'moderate': return 0.60;
+        case 'severe':   return 0.80;
+        case 'extreme':  return 0.95;
+        default:         return 0.60;
+    }
+}
+
+/**
+ * Extract a factor of the form "prefix:value" from tags.
+ * - If the mapping table matches, return the corresponding value
+ * - If an unknown value appears, return default
+ * - If no tag with the prefix exists, return default
+ */
+function extractTagFactor(array $tags, string $prefix, array $map, float $default): float
+{
+    foreach ($tags as $tag) {
+        if (!is_string($tag)) continue;
+        $needle = $prefix . ':';
+        if (strpos($tag, $needle) === 0) {
+            $val = cei_strlower_safe(substr($tag, strlen($needle)));
+            if (isset($map[$val])) return (float)$map[$val];
+            return $default;
+        }
+    }
+    return $default;
+}
+
+/**
+ * Baseline alert hazard strength (0-1):
+ * - Represents how strong an alert of this hazard typically is under "moderate severity + active phase"
+ * - Values here are intentionally conservative to avoid treating alerts as hard penalizers
+ */
+function getAlertHazardBase01(): array
+{
+    return [
+        'extreme_cold'     => 0.75,
+        'extreme_heat'     => 0.72,
+        'wind'             => 0.70,
+        'snow_ice'         => 0.80,
+        'heavy_rain'       => 0.72,
+        'thunderstorm'     => 0.80,
+        'flood'            => 0.90,
+        'coastal'          => 0.80,
+        'tropical_cyclone' => 0.95,
+        'tornado'          => 0.98,
+        'fog'              => 0.65,
+        'dust_sand'        => 0.70,
+        'fire'             => 0.85,
+        'air_quality'      => 0.75,
+        'avalanche'        => 0.95,
+        'geohazard'        => 0.92,
+        'other'            => 0.55,
+    ];
+}
+
+/**
+ * Temperature extreme risk (0-100):
+ * - cold_score: based on wind chill
+ * - heat_score: based on heat index (amplify when dew point is high)
+ * - score: max of the two
  *
- * @param string $str
- * @return string
+ * Note: this is "safety/health risk", not "comfort".
+ */
+function computeTemperatureRiskScore($T, $RH, $wind, $windGust = null, $dewPoint = null, $heatIndex = null)
+{
+    $flags = [];
+    $debug = [];
+
+    $vEff = $wind;
+    if ($windGust !== null && is_numeric($windGust) && $windGust > $vEff) {
+        $vEff = (float)$windGust;
+        $debug[] = 'temp_use_gust';
+    }
+
+    $windChill = calculateWindChill((float)$T, (float)$vEff);
+
+    $coldRisk = 0;
+    if ($windChill <= -45) { $coldRisk = 95; $flags[] = 'temp_extreme_cold_45'; }
+    elseif ($windChill <= -40) { $coldRisk = 90; $flags[] = 'temp_extreme_cold_40'; }
+    elseif ($windChill <= -35) { $coldRisk = 80; $flags[] = 'temp_extreme_cold_35'; }
+    elseif ($windChill <= -30) { $coldRisk = 65; $flags[] = 'temp_very_cold_30'; }
+    elseif ($windChill <= -25) { $coldRisk = 50; $flags[] = 'temp_cold_25'; }
+    elseif ($windChill <= -20) { $coldRisk = 35; $flags[] = 'temp_cold_20'; }
+
+    if ($heatIndex === null) {
+        $heatIndex = calculateHeatIndex((float)$T, (float)$RH);
+    }
+
+    if ($dewPoint !== null && is_numeric($dewPoint) && (float)$dewPoint >= 26) {
+        $heatIndex += ((float)$dewPoint >= 29) ? 4 : 2;
+        $debug[] = 'heat_dp_boost';
+    }
+
+    $heatRisk = 0;
+    if ($heatIndex >= 52) { $heatRisk = 90; $flags[] = 'temp_extreme_heat_52'; }
+    elseif ($heatIndex >= 41) { $heatRisk = 80; $flags[] = 'temp_extreme_heat_41'; }
+    elseif ($heatIndex >= 35) { $heatRisk = 60; $flags[] = 'temp_heat_35'; }
+    elseif ($heatIndex >= 32) { $heatRisk = 40; $flags[] = 'temp_heat_32'; }
+    elseif ($heatIndex >= 30) { $heatRisk = 28; $flags[] = 'temp_heat_30'; }
+
+    $score = max($coldRisk, $heatRisk);
+
+    return [
+        'score'       => max(0, min(100, (int)$score)),
+        'cold_score'  => max(0, min(100, (int)$coldRisk)),
+        'heat_score'  => max(0, min(100, (int)$heatRisk)),
+        'flags'       => $flags,
+        'debug_flags' => $debug
+    ];
+}
+
+/**
+ * Weather phenomenon risk (0-100 + hazards 0-1):
+ * - Identify snow, freezing rain, thunderstorm, heavy rain, fog, dust/sand, tornado, etc. from weatherId
+ * - Introduce wind gust/speed mapping into wind hazard
+ * - Apply borderline enhancement for snow/freezing rain around 0°C (more typical road-ice risks)
+ *
+ * Returns hazards: hazard => risk01 (for fusion as P)
+ */
+function computeWeatherRiskScore($weatherId, $windGust = null, $T = null, $wind = null)
+{
+    $score = 0;
+    $flags = [];
+    $debug = [];
+    $haz = [];
+
+    if ($weatherId >= 200 && $weatherId < 300) {
+        $haz['thunderstorm'] = 0.75;
+        $score = max($score, 70);
+        $flags[] = 'wx_thunderstorm';
+        if (in_array($weatherId, [212, 221, 232], true)) {
+            $haz['thunderstorm'] = 0.85;
+            $score = max($score, 75);
+            $flags[] = 'wx_thunderstorm_heavy';
+        }
+    }
+    elseif ($weatherId >= 300 && $weatherId < 400) {
+        $haz['heavy_rain'] = 0.25;
+        $score = max($score, 20);
+        $flags[] = 'wx_drizzle';
+    }
+    elseif ($weatherId >= 500 && $weatherId < 600) {
+        if (in_array($weatherId, [500, 520], true)) {
+            $haz['heavy_rain'] = 0.35; $score = max($score, 30); $flags[] = 'wx_rain_light';
+        } elseif (in_array($weatherId, [501, 521, 531], true)) {
+            $haz['heavy_rain'] = 0.55; $score = max($score, 50); $flags[] = 'wx_rain_moderate';
+        } elseif (in_array($weatherId, [502, 503, 504, 522], true)) {
+            $haz['heavy_rain'] = 0.70; $score = max($score, 60); $flags[] = 'wx_rain_heavy';
+        } elseif ($weatherId === 511) {
+            $haz['snow_ice'] = 0.80; $score = max($score, 70); $flags[] = 'wx_freezing_rain';
+        } else {
+            $haz['heavy_rain'] = 0.50; $score = max($score, 45); $flags[] = 'wx_rain';
+        }
+    }
+    elseif ($weatherId >= 600 && $weatherId < 700) {
+        if (in_array($weatherId, [600, 615, 620], true)) {
+            $haz['snow_ice'] = 0.55; $score = max($score, 40); $flags[] = 'wx_snow_light';
+        } elseif (in_array($weatherId, [601, 612, 621], true)) {
+            $haz['snow_ice'] = 0.70; $score = max($score, 55); $flags[] = 'wx_snow_moderate';
+        } else {
+            $haz['snow_ice'] = 0.78; $score = max($score, 65); $flags[] = 'wx_snow_heavy';
+        }
+    }
+    elseif ($weatherId >= 700 && $weatherId < 800) {
+        if (in_array($weatherId, [701, 721, 741], true)) {
+            $haz['fog'] = 0.55; $score = max($score, 35); $flags[] = 'wx_fog_mist';
+        } elseif (in_array($weatherId, [711], true)) {
+            $haz['air_quality'] = 0.45; $score = max($score, 35); $flags[] = 'wx_smoke';
+        } elseif (in_array($weatherId, [731, 751, 761, 762, 771], true)) {
+            $haz['dust_sand'] = 0.70; $score = max($score, 55); $flags[] = 'wx_dust_sand_squall';
+        } elseif ($weatherId === 781) {
+            $haz['tornado'] = 0.98; $score = max($score, 95); $flags[] = 'wx_tornado';
+        } else {
+            $haz['fog'] = max($haz['fog'] ?? 0.0, 0.45);
+            $score = max($score, 30);
+            $flags[] = 'wx_atmosphere';
+        }
+    }
+
+    // Wind: prefer wind_gust, otherwise wind_speed (if upstream does not provide gust)
+    $gust = null;
+    if ($windGust !== null && is_numeric($windGust)) $gust = (float)$windGust;
+    if ($gust === null && $wind !== null && is_numeric($wind)) $gust = (float)$wind;
+
+    if ($gust !== null) {
+        $windRisk01 = mapGustToRisk01($gust);
+        if ($windRisk01 > 0.01) {
+            $haz['wind'] = max($haz['wind'] ?? 0.0, $windRisk01);
+            $debug[] = 'wind_from_gust_or_wind';
+        }
+    }
+
+    // Snow/freezing rain around ~0°C: more typical icy road risk (borderline enhancement)
+    if ($T !== null && is_numeric($T) && isset($haz['snow_ice'])) {
+        $t = (float)$T;
+        if ($t >= -3.0 && $t <= 1.0) {
+            $haz['snow_ice'] = clamp01($haz['snow_ice'] + 0.08);
+            $debug[] = 'snow_ice_temp_band';
+        }
+    }
+
+    // score: also map hazards' risk01 to 0-100, for "compatibility field/coarse overview"
+    foreach ($haz as $k => $v) {
+        $score = max($score, (int)round(100.0 * clamp01($v)));
+    }
+
+    return [
+        'score'       => max(0, min(100, (int)$score)),
+        'hazards'     => $haz,
+        'flags'       => $flags,
+        'debug_flags' => $debug
+    ];
+}
+
+/**
+ * Map wind speed/gust to risk (0-1):
+ * - Piecewise linear: consider noticeable risk starting from 12 m/s
+ * - Tuned more to intuition for walking/driving/high-altitude object risk
+ */
+function mapGustToRisk01(float $gust_ms): float
+{
+    if ($gust_ms < 12) return 0.0;
+    if ($gust_ms < 15) return lerp01(($gust_ms - 12) / 3.0, 0.15, 0.35);
+    if ($gust_ms < 20) return lerp01(($gust_ms - 15) / 5.0, 0.35, 0.55);
+    if ($gust_ms < 25) return lerp01(($gust_ms - 20) / 5.0, 0.55, 0.75);
+    if ($gust_ms < 32) return lerp01(($gust_ms - 25) / 7.0, 0.75, 0.92);
+    return 0.95;
+}
+
+/**
+ * Air health risk (0-1):
+ * - This is "health risk", different from air comfort (comfort score)
+ * - Current implementation mainly considers PM2.5 and O3 (others can be extended later)
+ *
+ * The output risk_01 will be merged into P['air_quality'] to participate in risk fusion and capping.
+ */
+function computeAirHealthRisk(float $pm25, float $pm10, float $o3, float $co, float $no2, float $so2): array
+{
+    $r_pm25 = 0.0;
+    if     ($pm25 <= 35)  $r_pm25 = 0.0;
+    elseif ($pm25 <= 55)  $r_pm25 = lerp01(($pm25 - 35) / 20.0, 0.15, 0.35);
+    elseif ($pm25 <= 75)  $r_pm25 = lerp01(($pm25 - 55) / 20.0, 0.35, 0.55);
+    elseif ($pm25 <= 150) $r_pm25 = lerp01(($pm25 - 75) / 75.0, 0.55, 0.80);
+    elseif ($pm25 <= 250) $r_pm25 = lerp01(($pm25 - 150) / 100.0, 0.80, 0.95);
+    else                  $r_pm25 = 0.98;
+
+    $r_o3 = 0.0;
+    if     ($o3 <= 100) $r_o3 = 0.0;
+    elseif ($o3 <= 160) $r_o3 = lerp01(($o3 - 100) / 60.0, 0.15, 0.35);
+    elseif ($o3 <= 200) $r_o3 = lerp01(($o3 - 160) / 40.0, 0.35, 0.55);
+    elseif ($o3 <= 300) $r_o3 = lerp01(($o3 - 200) / 100.0, 0.55, 0.80);
+    else                $r_o3 = 0.90;
+
+    $r = max($r_pm25, $r_o3);
+
+    return [
+        'risk_01' => clamp01($r),
+        'debug'   => [
+            'pm25_r' => round($r_pm25, 3),
+            'o3_r'   => round($r_o3, 3),
+        ]
+    ];
+}
+
+/**
+ * Hazard impact weights:
+ * - Affect Noisy-OR aggregation: higher weights make the hazard more "sensitive" to the overall risk
+ * - Higher for extreme temperature / tropical cyclones / tornadoes; lower for fog, etc.
+ */
+function getHazardImpactWeights(): array
+{
+    return [
+        'extreme_cold'     => 1.00,
+        'extreme_heat'     => 1.00,
+        'wind'             => 0.90,
+        'snow_ice'         => 0.95,
+        'heavy_rain'       => 0.80,
+        'thunderstorm'     => 0.85,
+        'flood'            => 0.95,
+        'coastal'          => 0.85,
+        'tropical_cyclone' => 1.00,
+        'tornado'          => 1.00,
+        'fog'              => 0.60,
+        'dust_sand'        => 0.70,
+        'fire'             => 0.90,
+        'air_quality'      => 0.85,
+        'avalanche'        => 1.00,
+        'geohazard'        => 0.95,
+        'other'            => 0.55,
+    ];
+}
+
+/**
+ * Noisy-OR aggregation:
+ * - Each hazard contributes x (0-1), multiplied by weight w
+ * - Overall risk = 1 - Π(1 - x*w)
+ * Feature: multiple moderate risks add up but will not simply linearly add to "blow up".
+ */
+function combineHazardsNoisyOR(array $hazards, array $impactW, string $field): float
+{
+    $prod = 1.0;
+    foreach ($hazards as $hz => $info) {
+        if (!isset($info[$field])) continue;
+        $x = (float)$info[$field];
+        $w = (float)($impactW[$hz] ?? 0.6);
+
+        $xw = clamp01($x * $w);
+        $prod *= (1.0 - $xw);
+    }
+    return clamp01(1.0 - $prod);
+}
+
+/**
+ * Map overall risk r01 (0-1) to risk cap (0-100):
+ * - Lower cap means more dangerous (stronger capping)
+ * - Use a power function to make the "low-risk area more relaxed, high-risk area more sensitive"
+ */
+function mapOverallRiskToCap(float $r01): float
+{
+    $r01 = clamp01($r01);
+    $gamma = 1.35;
+    $cap = 100.0 * (1.0 - pow($r01, $gamma));
+    return max(0.0, min(100.0, $cap));
+}
+
+/**
+ * Risk hint aggregation (0-1):
+ * - For each hazard use h = max(P, A)
+ * - Aggregate with Noisy-OR to get H_overall
+ * Explanation: hint scores act more like a "reminder system"; may not trigger capping but will warn the user.
+ */
+function computeHintOverall(array $hazards, array $impactW): float
+{
+    $prod = 1.0;
+    foreach ($hazards as $hz => $info) {
+        $p = (float)($info['P'] ?? 0.0);
+        $a = (float)($info['A'] ?? 0.0);
+        $h = max($p, $a);
+
+        $w = (float)($impactW[$hz] ?? 0.6);
+        $hw = clamp01($h * $w);
+        $prod *= (1.0 - $hw);
+    }
+    return clamp01(1.0 - $prod);
+}
+
+/**
+ * Pick "user-readable risk factors" (hazard list):
+ * - Condition: R high enough or Focus high enough
+ * - Sort: prioritize Focus, then R
+ * - Take up to 8 to avoid UI overload
+ */
+function pickUserFactors(array $hazards): array
+{
+    $picked = [];
+
+    foreach ($hazards as $hz => $info) {
+        $r = (float)($info['R'] ?? 0.0);
+        $f = (float)($info['Focus'] ?? 0.0);
+
+        if ($r >= 0.35 || $f >= 0.45) {
+            $picked[] = $hz;
+        }
+    }
+
+    usort($picked, function($a, $b) use ($hazards) {
+        $fa = (float)($hazards[$a]['Focus'] ?? 0.0);
+        $fb = (float)($hazards[$b]['Focus'] ?? 0.0);
+        if ($fa === $fb) {
+            $ra = (float)($hazards[$a]['R'] ?? 0.0);
+            $rb = (float)($hazards[$b]['R'] ?? 0.0);
+            return ($rb <=> $ra);
+        }
+        return ($fb <=> $fa);
+    });
+
+    $picked = array_values(array_unique($picked));
+    return array_slice($picked, 0, 8);
+}
+
+/**
+ * Max alert contribution (for compatibility field from_alerts):
+ * - Estimate the maximum possible influence from the alert side using a*q (strength × credibility)
+ * - Note: this is not the direct source of capping; just for explanation/statistics
+ */
+function maxAlertContribution(array $hazards): float
+{
+    $m = 0.0;
+    foreach ($hazards as $hz => $info) {
+        $a = (float)($info['A'] ?? 0.0);
+        $q = (float)($info['Q'] ?? 0.0);
+        $m = max($m, $a * $q);
+    }
+    return $m;
+}
+
+/**
+ * Extract hazard list from tags:
+ * - Recognize "hazard:xxx"
+ * - Return a de-duplicated array of hazard names
+ */
+function extractHazardsFromTags(array $tags): array
+{
+    $hazards = [];
+    foreach ($tags as $tag) {
+        if (!is_string($tag)) continue;
+        if (strpos($tag, 'hazard:') === 0) {
+            $h = substr($tag, 7);
+            if ($h !== '') $hazards[] = $h;
+        }
+    }
+    return array_values(array_unique($hazards));
+}
+
+/**
+ * Safe lowercase conversion (UTF-8 friendly).
  */
 function cei_strlower_safe(string $str): string
 {
@@ -1251,4 +1426,23 @@ function cei_strlower_safe(string $str): string
         return mb_strtolower($str, 'UTF-8');
     }
     return strtolower($str);
+}
+
+/**
+ * Clamp float to [0,1].
+ */
+function clamp01(float $x): float
+{
+    if ($x < 0.0) return 0.0;
+    if ($x > 1.0) return 1.0;
+    return $x;
+}
+
+/**
+ * Linear interpolation (t∈[0,1], returns [a,b]).
+ */
+function lerp01(float $t, float $a, float $b): float
+{
+    $t = clamp01($t);
+    return $a + ($b - $a) * $t;
 }

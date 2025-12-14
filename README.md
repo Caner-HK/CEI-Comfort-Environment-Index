@@ -31,48 +31,47 @@ explainable and machine-friendly framework.
 
 ### ✔ Two-Layer Architecture: Comfort Layer + Risk Cap Layer
 
-Starting from **v3.0.0**, CEI is explicitly divided into two separable but combinable layers:
+Since **v3.0.0**, CEI has been clearly separated into two independent yet composable layers:
 
 1. **Comfort Layer**  
-   Answers the question: *“How comfortable does it feel right now?”* based on:
+   Measures “how comfortable the environment feels under current conditions,” combining:
+   - Thermal comfort (temperature, humidity, wind, perceived temperature)
+   - Air comfort (multi-pollutant air quality)
+   - UV comfort (UVI)
+   - Pressure comfort (pressure)
 
-   - Thermal comfort (temperature, humidity, wind, apparent temperature)
-   - Air comfort (multiple pollutants)
-   - UV comfort
-   - Pressure comfort
+   Outputs a **0–100 Comfort CEI (`comfort_cei`)**.
 
-   It produces a **0–100 comfort CEI (`comfort_cei`)**.
+2. **Risk Layer** (v3.2.0)  
+   Measures “how dangerous the environment is,” and outputs **RiskCap** (a cap) to constrain the final CEI.
+   This layer adopts **Hazard Bucket Fusion**:
 
-2. **Risk Layer**  
-   Answers the question: *“How dangerous is it right now?”* by independently evaluating:
+   - Risks are bucketed by hazards (e.g. `extreme_cold`, `snow_ice`, `wind`, `heavy_rain`, `thunderstorm`, `air_quality`, …)
+   - For each hazard, it computes:
+     - **P (Physical)**: physical risk inferred from observations/feels-like signals (Heat Index, Wind Chill, `weather_id`, gusts, etc.)
+     - **A (Alert)**: alert intensity inferred from official alerts (hazard + severity + time phase)
+     - **Q (Quality)**: alert credibility / hit confidence (certainty / urgency / area / time phase)
+   - Final fused intensity **R**: alerts only “fill the gap” to avoid double-penalizing the same source:
+     > **R = P + Q · max(0, A − P)**
 
-   - Extreme cold / heat and related health risks
-   - Hazardous weather (severe thunderstorms, snowstorms, dust storms, tornadoes, strong gusts, freezing rain, etc.)
-   - Official warnings from government weather / disaster agencies  
-     (typhoons, heavy rain, avalanche, floods, severe pollution, etc.)
+   It also outputs:
+   - `risk` (overall): overall risk intensity (0=no risk, 100=extreme risk)
+   - `risk_cap`: the actual cap used for limiting CEI (0–100, **lower means more dangerous**)
+   - `risk_hint`: a more sensitive hint score (leans toward `max(P, A)`; good for “warn but not necessarily cap”)
+   - `risk_focus`: a focus score (higher when P and A align with high Q; good for “highlight/attention”)
 
-   The risk layer outputs a **0–100 `riskScore`**, then converts it to:
-
-   > **RiskCap = 100 − riskScore**
-
-The final CEI is defined as:
+Final CEI is defined as:
 
 > **CEI = min(Comfort CEI, RiskCap)**
 
-Interpretation:
-
-- If the environment *feels* comfortable but objective risk is high  
-  (e.g. sunny day but with a red avalanche warning),  
-  **RiskCap limits the upper bound of CEI**, avoiding a misleading sense of safety.
-- If risk is low, CEI is mainly driven by the comfort layer and reflects perceived comfort.
-
-Both layers are exposed explicitly in the output for UI and AI use:
+Both layers are explicitly exposed for frontend and AI usage:
 
 - `cei` – final 0–100 index  
-- `components.risk` – risk component score  
+- `components.risk` – overall risk intensity (0–100)  
 - `detail.comfort_cei` – comfort-only CEI  
-- `detail.risk_cap` – upper bound imposed by risk  
-- `detail.main_effect` – dominant factor right now (`heat` / `air` / `uv` / `pressure` / `risk`)
+- `detail.risk_cap` – risk cap applied to final CEI  
+- `detail.risk_hint` / `detail.risk_focus` – hint/focus signals  
+- `detail.risk.hazards` – hazard bucket details (explainable/visualizable)
 
 ---
 
@@ -253,92 +252,150 @@ This “weakest-link” design reflects real-world health exposure:
 
 ---
 
-## ⚠️ Risk Recognition & Alert Timings
+## ⚠️ Risk & Alerts
 
-### ✔ Three Sources of Risk
+The Risk Layer measures “how dangerous the environment is” and outputs **RiskCap** to constrain the final CEI, preventing inflated safety impressions when conditions feel fine but objective hazards exist.  
+In **v3.2.0**, CEI introduces **Hazard Bucket Fusion**: risks are bucketed by hazard and fused per bucket using both **Physical signals** and **Official alerts**, reducing double-penalization and improving explainability and UI usability.
 
-The risk layer decomposes risk into three sources:
+---
 
-1. **Temperature Risk**
-   Based on heat index, wind chill, dew point and related indicators,
-   evaluating risks like heat stroke, frostbite, hypothermia.
-   It emits flags such as:
+### ✔ Three Risk Sources (kept conceptually, fused into hazard buckets)
 
-   * `temp_extreme_cold_35`
-   * `temp_heat_35`
-   * `temp_windchill_-20`, etc.
+You can still think of the Risk Layer as three sources, but they ultimately map into the same hazard bucket structure (see `hazards` below):
 
-2. **Weather Risk**
-   Uses `weather_id` and `wind_gust` to detect:
+1. **Temperature Risk → part of Physical (P)**  
+   Evaluated from Heat Index, Wind Chill, Dew Point, etc. to reflect heat illness, frostbite, hypothermia, and related risks. It may emit internal markers (examples):
+   - `temp_extreme_cold_35`
+   - `temp_heat_35`
+   - `temp_use_gust` / `heat_dp_boost` (debug/explain)
 
-   * Severe thunderstorms, heavy rain, snowstorms, freezing rain
-   * Dense fog, dust storms, tornadoes, etc.
+   At the hazard level, it mainly contributes to:
+   - `extreme_cold`
+   - `extreme_heat`
 
-   And emits flags such as `wx_thunderstorm_heavy`, `wx_freezing_rain`, `wind_gust_25`.
+2. **Weather Phenomena Risk → part of Physical (P)**  
+   Identified from `weather_id` and `wind_gust` (fallback to `wind_speed`) for hazardous conditions such as:
+   - severe thunderstorms, heavy rain, blizzards, freezing rain
+   - fog, dust/sand storms, tornadoes
+   - strong gusts / wind
 
-3. **Alerts Risk**
-   Uses adapter layers for OpenWeather, QWeather (HeWeather) and others,
-   normalizing provider-specific alerts into a unified structure, for example:
+   Example internal markers:
+   - `wx_thunderstorm_heavy`, `wx_freezing_rain`, `wx_dust_sand_squall`, `wx_tornado`
+   - `wind_from_gust_or_wind`
+
+   At the hazard level, it mainly contributes to:
+   - `thunderstorm` / `heavy_rain` / `snow_ice` / `fog` / `dust_sand` / `tornado` / `wind`, etc.
+
+3. **Official Alerts Risk → Alert (A) and Quality (Q)**  
+   Alerts from OpenWeather / QWeather (and others) are normalized by an adapter into a standard structure (example):
 
    ```php
    [
-     'event'          => 'Gale Blue Warning',
-     'description'    => 'Gale force winds expected in the next 24 hours…',
+     'event'          => 'Wind Alert (Blue)',
+     'description'    => 'Strong winds expected within the next 24 hours...',
      'tags'           => [
        'hazard:wind',
        'severity:minor',
-       'color:blue',
+       'certainty:likely',
+       'urgency:expected',
+       'area:city',
        'provider:qweather'
      ],
      'severity'       => 'minor',
-     'severity_score' => null, // reserved for model-based 0–1 severity score
-     'code'           => 1006, // provider-specific code
-
-     'start_ts'       => 1732854000, // alert start time (Unix timestamp, UTC seconds)
-     'end_ts'         => 1732940400  // alert end time
+     'severity_score' => null, // optional: continuous 0–1 severity (future model)
+     'code'           => 1006,
+     'start_ts'       => 1732854000, // UTC seconds
+     'end_ts'         => 1732940400
    ]
    ```
 
-### ✔ Time Validity of Alerts
+   * **A (Alert intensity)** = hazard base × severity × time phase
+   * **Q (Credibility / hit confidence)** is derived from `certainty / urgency / area` and time phase
+Alerts are bucketed into `A[hazard]` and `Q[hazard]` for fusion.
 
-Since **v3.1.0**, CEI accounts for alert timing when computing `alerts` risk:
+---
 
-* Current time < `start_ts` → alert **not yet started**:
-  Considered as early warning, with **reduced** impact on risk to avoid
-  lowering CEI too early.
+### ✔ Hazard Bucket Fusion (v3.2.0 core): P / A / Q → R
 
-* `start_ts` ≤ current time ≤ `end_ts` → alert **active**:
-  Counts with full weight in the risk score.
+For each hazard bucket, the risk layer keeps:
+- **P (Physical)**: physical risk inferred from observations / feels-like signals
+- **A (Alert)**: official alert intensity
+- **Q (Quality)**: alert credibility / hit confidence
 
-* Current time > `end_ts` → alert **expired**:
-  Treated as background information; impact can be heavily reduced or ignored.
+The fused intensity **R (Fusion Risk)** is:
 
-All times are in **Unix timestamp (UTC seconds)** to avoid time-zone issues.
+> **R = P + Q · max(0, A − P)**
 
-### ✔ Risk Output Structure
+Interpretation:
+- When **physical risk is already high (P high)**, alerts won’t “penalize again” (avoids double counting)
+- When **alert intensity exceeds physical evidence (A > P)**, alerts only fill the gap, scaled by **Q**
+- It also outputs **Focus**: more “attention-oriented”; higher when P and A align under high Q
 
-In the final result, risk-related fields look like:
+---
+
+### ✔ Alert Timing + Forecast Evaluation Timestamp (ts)
+
+To support forecast CEI evaluation “at a future moment,” the risk layer uses an **evaluation timestamp `ts`**:
+- `data['ts']` (UTC seconds) is supported as the evaluation time (recommended for forecasts)
+- If `ts` is not provided, it falls back to `time()`
+
+Alerts are categorized into phases:
+- **lead (not started yet)**: decayed as an early reminder
+- **active (in effect)**: fully applied
+- **past (expired)**: zeroed or heavily decayed
+
+All timing uses **Unix timestamps (UTC seconds)** to avoid timezone ambiguity.
+
+---
+
+### ✔ Risk Output Structure (UI- and explanation-friendly)
+
+The risk layer outputs not only an overall risk score, but also three user-facing signals and detailed hazard buckets:
 
 ```php
 'components' => [
-  'heat'     => int, // 0–100
+  'heat'     => int,
   'air'      => int,
   'uv'       => int,
   'pressure' => int,
-  'risk'     => int  // 0–100
+  'risk'     => int  // overall risk intensity 0–100
 ],
 
 'detail' => [
+  'risk_cap'   => float, // cap 0–100, lower means more dangerous (NOT simply 100-risk)
+  'risk_hint'  => int,   // hint score (more sensitive; tends to max(P, A))
+  'risk_focus' => int,   // focus score (good for UI highlight)
+
   'risk' => [
-    'overall'      => int,      // overall risk 0–100
-    'from_temp'    => int,      // risk from temperature
-    'from_weather' => int,      // risk from weather phenomena
-    'from_alerts'  => int,      // risk from official alerts
-    'flags'        => string[]  // machine-friendly flags for explanation / AI
-  ],
-  'risk_cap' => float           // 100 - riskScore
+    'overall' => int,     // same as components.risk
+    'cap'     => float,   // same as detail.risk_cap
+    'hint'    => int,     // same as detail.risk_hint
+    'focus'   => int,     // same as detail.risk_focus
+
+    'from_temp'    => int,
+    'from_weather' => int,
+    'from_alerts'  => int,
+
+    'factors'     => string[],  // suggested user-facing hazards (max 8)
+    'debug_flags' => string[],  // internal debug flags (not recommended for UI)
+
+    'hazards' => [
+      'wind' => [
+        'P' => 0.000, 'A' => 0.650, 'Q' => 0.720, 'R' => 0.468, 'Focus' => 0.650,
+        'source' => ['physical' => false, 'alert' => true]
+      ],
+      // ...
+    ]
+  ]
 ]
 ```
+
+> Intuition:
+>
+> * `risk_cap` for capping (limits the final CEI)
+> * `risk_hint` for warnings (more sensitive; not always capping)
+> * `risk_focus` for highlighting (higher when P and A align with high Q)
+> * `hazards` for explainability and visualization
 
 ---
 
@@ -348,15 +405,15 @@ A typical `computeCEI()` call returns a structure like:
 
 ```php
 [
-  'cei'   => int,    // 0–100 final index
-  'level' => string, // e.g. "CEI Level 2 – Comfortable",
+  'cei'   => int,    // 0–100 Final Index
+  'level' => string,
 
   'components' => [
     'heat'     => int,
     'air'      => int,
     'uv'       => int,
     'pressure' => int,
-    'risk'     => int
+    'risk'     => int  // Risk intensity 0–100
   ],
 
   'weights' => [
@@ -367,14 +424,16 @@ A typical `computeCEI()` call returns a structure like:
   ],
 
   'detail' => [
-    'comfort_cei' => float,              // comfort layer CEI only
-    'risk_cap'    => float,              // upper bound from risk (100 - riskScore)
+    'comfort_cei' => float,
+    'risk_cap'    => float, // Cap pressure limit (0–100, lower values ​​indicate higher risk)
+    'risk_hint'   => int,   // Risk warning score (more sensitive)
+    'risk_focus'  => int,   // Risk Awareness
     'main_effect' => 'heat'|'air'|'uv'|'pressure'|'risk',
 
     'climate' => [
-      'zone'        => string,           // climate zone
-      'factor'      => float,            // seasonal scaling factor
-      'comfortTemp' => float             // comfort temperature baseline
+      'zone'        => string,
+      'factor'      => float,
+      'comfortTemp' => float
     ],
 
     'thermal' => [
@@ -384,11 +443,24 @@ A typical `computeCEI()` call returns a structure like:
     ],
 
     'risk' => [
-      'overall'      => int,
+      'overall'      => int,    // same as components.risk
+      'cap'          => float,  // same as detail.risk_cap
+      'hint'         => int,    // same as detail.risk_hint
+      'focus'        => int,    // same as detail.risk_focus
+
+      // Compatible fields (for the convenience of continued use by the old UI/statistics)
       'from_temp'    => int,
       'from_weather' => int,
       'from_alerts'  => int,
-      'flags'        => string[]
+
+      // User-readable factors (recommended for display)
+      'factors'      => string[],
+
+      // Internal debugging (not recommended for display as a factor)
+      'debug_flags'  => string[],
+
+      // Hazard binning details (explainable/visualizable)
+      'hazards'      => array
     ]
   ]
 ]
@@ -596,8 +668,9 @@ Benefits:
 | v3.0.0  | 2025-11-28 | Risk-aware / extreme-conditions update: introduced a separate risk layer (extreme temperatures, hazardous weather, official alerts), a RiskCap mechanism, structured risk breakdown outputs, and support for `dew_point`, `wind_gust`, `alerts` and related fields.                                        |
 | v3.1.0  | 2025-11-29 | Alert timing update: added `start_ts` / `end_ts` (Unix timestamps, UTC seconds) to the unified alerts structure; differentiated “not started / active / expired” alerts in the risk score; improved risk constraints in early-warning scenarios to avoid over-penalizing CEI before events actually begin. |
 | v3.1.1  | 2025-12-02 | Southern Hemisphere climate fix: redefined climate zones based on absolute latitude and introduced Southern Hemisphere seasonal mapping (`monthNorm`), correcting summer/winter classification and comfort temperature for Southern Hemisphere cities, improving global behavior over cold/warm regions.   |
+| v3.2.0  | 2025-12-14 | Risk layer upgrade: Hazard Bucket Fusion (P/A/Q/R) to avoid double-penalization by fusing alerts with physical signals; added `ts` for forecast-time evaluation; added `risk_hint` and `risk_focus`; exposed hazard bucket details (`hazards`) and a user-facing `factors` list. |
 
-> **Current version: v3.1.1 – Southern Hemisphere Climate Fix**
+> **Current version: v3.2.0 – Risk Layer Upgrade**
 
 ---
 

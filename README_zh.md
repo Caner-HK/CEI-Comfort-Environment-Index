@@ -33,7 +33,6 @@ CWC CEI（Comfort Environment Index，环境舒适度指数）是一套将 **天
 
 1. **舒适度层（Comfort Layer）**  
    关注“在当前条件下，这个环境有多舒服”，综合：
-
    - 热舒适（温度、湿度、风速、体感温度）
    - 空气舒适（多污染物）
    - 紫外线舒适（UV）
@@ -41,34 +40,36 @@ CWC CEI（Comfort Environment Index，环境舒适度指数）是一套将 **天
 
    输出一个 **0–100 的舒适度 CEI（`comfort_cei`）**。
 
-2. **风险层（Risk Layer）**  
-   关注“这个环境有多危险”，单独评估：
+2. **风险层（Risk Layer）**（v3.2.0）  
+   关注“这个环境有多危险”，并输出 **RiskCap（压帽上限）** 来限制最终 CEI。
+   风险层采用 **Hazard Bucket Fusion（风险分桶相关性感知融合）**：
 
-   - 极端低温 / 高温及相关健康风险
-   - 危险天气（强雷暴、暴雪、沙尘暴、龙卷风、强阵风、冻雨等）
-   - 来自官方机构的气象 / 灾害预警（如台风、暴雨、雪崩、洪水、严重污染等）
+   - 将风险按 hazard 分桶（如 `extreme_cold`、`snow_ice`、`wind`、`heavy_rain`、`thunderstorm`、`air_quality`…）
+   - 对每个 hazard 同时计算：
+     - **P（Physical）**：由体感/观测推导的物理风险（热指数、风寒、weather_id、阵风等）
+     - **A（Alert）**：由官方预警推导的预警强度（hazard + severity + 时间相位）
+     - **Q（Quality）**：预警可信度/命中度（certainty/urgency/area/时间相位）
+   - 最终融合强度 **R**：预警只“补缺口”，避免同源重复扣分：
+     > **R = P + Q · max(0, A − P)**
 
-   风险层输出 **0–100 的风险分 `riskScore`**，并换算为：
-
-   > **RiskCap = 100 − riskScore**
+   同时输出：
+   - `risk`（overall）：总体风险强度（0=无风险，100=极端风险）
+   - `risk_cap`：真正用于压帽的上限分（0–100，**越低越危险**）
+   - `risk_hint`：更敏感的提示分（更倾向于 `max(P, A)`，适合“提醒但不一定压帽”）
+   - `risk_focus`：关注度分（当 P 与 A 一致且 Q 较高时更高，用于“重点关注”）
 
 最终 CEI 定义为：
 
 > **CEI = min(Comfort CEI, RiskCap)**
 
-含义：
-
-- 若体感“很舒服”但客观风险较高（如：晴朗天气下存在雪崩红色预警），  
-  **RiskCap 会限制最终 CEI 的上限**，防止指数给出“虚高的安全感”。
-- 若风险较低，则 CEI 主要由舒适度层驱动，体现真实体感。
-
 在输出结构中，两层数据都会被显式暴露，便于前端与 AI 使用：
 
 - `cei` – 最终 0–100 指数  
-- `components.risk` – 风险组件分数  
+- `components.risk` – 风险强度（0–100）  
 - `detail.comfort_cei` – 仅舒适度层的 CEI  
-- `detail.risk_cap` – 风险层施加的上限  
-- `detail.main_effect` – 当前环境的主导因素（heat / air / uv / pressure / risk）
+- `detail.risk_cap` – 风险层施加的上限（用于压帽）  
+- `detail.risk_hint` / `detail.risk_focus` – 提醒/关注信号  
+- `detail.risk.hazards` – hazard 分桶明细（可解释/可视化）
 
 ---
 
@@ -246,27 +247,43 @@ CEI 对六类主要污染物分别进行评分，然后取最差者作为空气�
 
 ## ⚠️ 风险识别与预警时效（Risk & Alerts）
 
-### ✔ 三类风险来源
+风险层关注“这个环境有多危险”，并输出 **RiskCap（压帽上限）** 来限制最终 CEI，避免“体感舒服但客观风险很高”的虚高评分。
+**v3.2.0** 引入 **Hazard Bucket Fusion（风险分桶相关性感知融合）**：将风险按 hazard 分桶，并在每个分桶内协同融合 **体感/现象（Physical）** 与 **官方预警（Alert）**，减少同源重复扣分、提升可解释性与 UI 可用性。
 
-风险层将风险拆为三部分：
+### ✔ 三类风险来源（仍然保留，但会在 hazard 分桶中融合）
 
-1. **温度风险（Temperature Risk）**  
-   基于热指数、风寒、露点等指标，评估中暑、冻伤、低体温等风险，并输出如：
+风险层仍可理解为三类来源，但最终会落到同一套 hazard 分桶结构（见下文 `hazards`）：
 
-   - `temp_extreme_cold_35`
-   - `temp_heat_35`
-   - `temp_windchill_-20` 等标记。
+1. **温度风险（Temperature Risk） → Physical（P）的一部分**
+   基于热指数（Heat Index）、风寒（Wind Chill）、露点（Dew Point）等评估中暑、冻伤、低体温风险，并产生内部标记（示例）：
 
-2. **天气风险（Weather Risk）**  
-   使用 `weather_id` 与 `wind_gust` 识别：
+   * `temp_extreme_cold_35`
+   * `temp_heat_35`
+   * `temp_use_gust` / `heat_dp_boost` 等（调试/解释用）
 
-   - 强雷暴、强降雨、暴雪、冻雨  
-   - 浓雾、沙尘暴、龙卷风等现象  
-   对应输出 `wx_thunderstorm_heavy`, `wx_freezing_rain`, `wind_gust_25` 等标记。
+   在 hazard 维度上，主要贡献到：
 
-3. **预警风险（Alerts Risk）**  
-   通过适配层对 OpenWeather、QWeather（和风天气）等平台的预警进行结构化统一，  
-   转换为类似下列结构：
+   * `extreme_cold`
+   * `extreme_heat`
+
+2. **天气现象风险（Weather Risk） → Physical（P）的一部分**
+   使用 `weather_id` 与 `wind_gust`（或回退 `wind_speed`）识别危险现象（示例）：
+
+   * 强雷暴、强降雨、暴雪、冻雨
+   * 浓雾、沙尘暴、龙卷风
+   * 强阵风/大风
+
+   对应内部标记（示例）：
+
+   * `wx_thunderstorm_heavy`, `wx_freezing_rain`, `wx_dust_sand_squall`, `wx_tornado`
+   * `wind_from_gust_or_wind`
+
+   在 hazard 维度上，主要贡献到：
+
+   * `thunderstorm` / `heavy_rain` / `snow_ice` / `fog` / `dust_sand` / `tornado` / `wind` 等
+
+3. **官方预警风险（Alerts Risk） → Alert（A）与 Quality（Q）**
+   通过适配层统一 OpenWeather / QWeather 等预警为标准结构（示例）：
 
    ```php
    [
@@ -275,55 +292,115 @@ CEI 对六类主要污染物分别进行评分，然后取最差者作为空气�
      'tags'           => [
        'hazard:wind',
        'severity:minor',
-       'color:blue',
+       'certainty:likely',
+       'urgency:expected',
+       'area:city',
        'provider:qweather'
      ],
      'severity'       => 'minor',
-     'severity_score' => null, // 预留给未来模型输出 0–1 连续严重度
-     'code'           => 1006, // 数据源内部预警代码
-
-     'start_ts'       => 1732854000, // 预警开始时间（Unix 时间戳，UTC 秒）
-     'end_ts'         => 1732940400  // 预警结束时间
+     'severity_score' => null, // 可选：0–1 连续严重度（未来模型可填）
+     'code'           => 1006,
+     'start_ts'       => 1732854000, // UTC 秒
+     'end_ts'         => 1732940400
    ]
    ```
 
-### ✔ 预警时效处理
+   * **A（Alert 强度）**：hazard 基准 × 严重度 × 时间相位
+   * **Q（可信度/命中度）**：由 `certainty / urgency / area` 与时间相位综合得到
+     预警会按 hazard 分桶写入 `A[hazard]` 与 `Q[hazard]`，用于后续融合。
 
-自 **v3.1.0** 起，CEI 在计算 `alerts` 风险时考虑时间维度：
+---
 
-- 当前时间 < `start_ts` → 预警 **尚未开始**：  
-  风险影响较弱（可视为“提前提醒”），避免过早拉低 CEI。
-- `start_ts` ≤ 当前时间 ≤ `end_ts` → 预警 **生效中**：  
-  按完整权重计入风险。
-- 当前时间 > `end_ts` → 预警 **已过期**：  
-  仅作为背景信息，风险影响可大幅减弱或忽略。
+### ✔ Hazard Bucket Fusion（v3.2.0 核心）：P / A / Q → R
+
+对每个 hazard 分桶，风险层同时拥有：
+
+* **P（Physical）**：体感/观测推导的物理风险（来自温度极端、天气现象、强风、空气健康风险等）
+* **A（Alert）**：官方预警强度
+* **Q（Quality）**：预警可信度/命中度
+
+最终融合强度 **R（Fusion Risk）** 的关键公式是：
+
+> **R = P + Q · max(0, A − P)**
+
+含义：
+
+* 当 **体感风险已很强（P 高）**，预警不会“再扣一次分”（避免同源重复扣分）。
+* 当 **预警强度高于体感（A > P）**，预警只在“差值”上补缺口，并由 **Q** 决定补多少（更可信的预警补得更多）。
+* 另外输出 **Focus（关注度）**：更偏“提醒/关注”，当 P 与 A 一致且 Q 较高时会更高，用于 UI “重点关注”。
+
+---
+
+### ✔ 预警时效处理 + Forecast 评估时刻 ts
+
+为支持 forecast 场景在“未来某时刻”计算 CEI，风险层使用 **评估时刻 `ts`**：
+
+* 新增 `data['ts']`（UTC 秒）作为评估时刻（forecast 建议传入）
+* 若未提供 `ts`，默认使用 `time()`
+
+风险层据此判断预警处于：
+
+* **lead（未开始）**：按提前提醒衰减（避免未来很久的预警过早压帽）
+* **active（生效中）**：完整计入
+* **past（已过期）**：归零或大幅衰减
 
 时间统一使用 **Unix 时间戳（UTC 秒）**，避免时区偏差。
 
-### ✔ 风险输出结构
+---
 
-在最终结果中，风险相关字段如下：
+### ✔ 风险输出结构（UI 与解释友好）
+
+风险层输出不仅有总体风险，还提供“压帽、提示、关注”三条信号与 hazard 明细：
 
 ```php
 'components' => [
-  'heat'     => int, // 0–100
+  'heat'     => int,
   'air'      => int,
   'uv'       => int,
   'pressure' => int,
-  'risk'     => int  // 0–100
+  'risk'     => int  // 风险强度 0–100（overall）
 ],
 
 'detail' => [
+  'risk_cap'   => float, // 压帽上限（0–100，越低越危险；不是简单 100-risk）
+  'risk_hint'  => int,   // 提示分（更敏感：更倾向 max(P, A)）
+  'risk_focus' => int,   // 关注度（适合 UI “重点关注”）
+
   'risk' => [
-    'overall'      => int,      // 风险总分 0–100
-    'from_temp'    => int,      // 来自温度的风险
-    'from_weather' => int,      // 来自天气现象的风险
-    'from_alerts'  => int,      // 来自官方预警的风险
-    'flags'        => string[]  // 风险标记，用于机器与 AI 解释
-  ],
-  'risk_cap' => float           // 100 - riskScore
+    'overall' => int,     // 同 components.risk
+    'cap'     => float,   // 同 detail.risk_cap
+    'hint'    => int,     // 同 detail.risk_hint
+    'focus'   => int,     // 同 detail.risk_focus
+
+    // 兼容字段（用于旧统计/UI 延续）
+    'from_temp'    => int,
+    'from_weather' => int,
+    'from_alerts'  => int,
+
+    // 建议前端展示：用户可读风险因素（hazard 列表，最多 8 个）
+    'factors'     => string[],
+
+    // 不建议作为“风险因素”展示：内部调试标记
+    'debug_flags' => string[],
+
+    // hazard 分桶详情：每个 hazard 的 P/A/Q/R/Focus（可解释/可视化）
+    'hazards' => [
+      'wind' => [
+        'P' => 0.000, 'A' => 0.650, 'Q' => 0.720, 'R' => 0.468, 'Focus' => 0.650,
+        'source' => ['physical' => false, 'alert' => true]
+      ],
+      // ...
+    ]
+  ]
 ]
 ```
+
+> 直观理解：
+>
+> * `risk_cap` 用于“压帽”（决定最终 CEI 上限）
+> * `risk_hint` 用于“提醒”（更敏感，不一定压帽）
+> * `risk_focus` 用于“重点关注”（P 与 A 一致且 Q 高时更高）
+> * `hazards` 用于“解释与可视化”（让 UI/AI 明白风险来自哪里、为何融合）
 
 ---
 
@@ -334,14 +411,14 @@ CEI 对六类主要污染物分别进行评分，然后取最差者作为空气�
 ```php
 [
   'cei'   => int,    // 0–100 最终指数
-  'level' => string, // 例如 "CEI Level 2 – Comfortable"
+  'level' => string,
 
   'components' => [
     'heat'     => int,
     'air'      => int,
     'uv'       => int,
     'pressure' => int,
-    'risk'     => int
+    'risk'     => int  // 风险强度 0–100
   ],
 
   'weights' => [
@@ -352,14 +429,16 @@ CEI 对六类主要污染物分别进行评分，然后取最差者作为空气�
   ],
 
   'detail' => [
-    'comfort_cei' => float,              // 仅舒适层 CEI
-    'risk_cap'    => float,              // 风险施加的上限（100 - riskScore）
+    'comfort_cei' => float,
+    'risk_cap'    => float, // 压帽上限（0–100，越低越危险）
+    'risk_hint'   => int,   // 风险提示分（更敏感）
+    'risk_focus'  => int,   // 风险关注度
     'main_effect' => 'heat'|'air'|'uv'|'pressure'|'risk',
 
     'climate' => [
-      'zone'        => string,           // 气候带
-      'factor'      => float,            // 季节缩放因子
-      'comfortTemp' => float             // 舒适温度基准
+      'zone'        => string,
+      'factor'      => float,
+      'comfortTemp' => float
     ],
 
     'thermal' => [
@@ -369,11 +448,24 @@ CEI 对六类主要污染物分别进行评分，然后取最差者作为空气�
     ],
 
     'risk' => [
-      'overall'      => int,
+      'overall'      => int,    // 同 components.risk
+      'cap'          => float,  // 同 detail.risk_cap
+      'hint'         => int,    // 同 detail.risk_hint
+      'focus'        => int,    // 同 detail.risk_focus
+
+      // 兼容字段（便于旧 UI/统计继续用）
       'from_temp'    => int,
       'from_weather' => int,
       'from_alerts'  => int,
-      'flags'        => string[]
+
+      // 用户可读因素（建议展示）
+      'factors'      => string[],
+
+      // 内部调试（不建议当因素展示）
+      'debug_flags'  => string[],
+
+      // hazard 分桶详情（可解释/可视化）
+      'hazards'      => array
     ]
   ]
 ]
@@ -517,6 +609,8 @@ $data = [
 
     // ——— 预警（可选，由适配层统一后的数组）———
     'alerts'     => $normalizedAlerts ?? [],
+
+    'ts' => 1734211200, // 可选：评估时刻（UTC 秒；forecast 建议传）
 ];
 
 // 2. 单位与时空信息
@@ -576,8 +670,10 @@ CEI 通过提供结构化的 **环境舒适与风险语义层**，让小模型�
 | v3.0.0 | 2025-11-28 | 风险感知 / 极端条件更新：引入独立风险层（极端温度、危险天气、官方预警），增加 RiskCap 上限机制，提供结构化风险拆分输出，并支持 `dew_point` / `wind_gust` / `alerts` 等字段。                                                                     |
 | v3.1.0 | 2025-11-29 | 预警时效更新：为统一 alerts 结构新增 `start_ts` / `end_ts`（Unix 时间戳，UTC 秒），在风险评分中区分“未开始 / 生效中 / 已过期”预警，优化提前预警场景下的风险约束，避免尚未发生的事件过早拉低 CEI。                                                     |
 | v3.1.1 | 2025-12-02 | 南半球气候区修正：基于绝对纬度重新划分气候带，引入南半球季节映射（`monthNorm`），修复南半球城市在夏冬季判断与舒适温度上的偏差，使 CEI 在全球范围内对冷暖区域的表现更加合理。                                                                     |
+| v3.2.0 | 2025-12-14 | 风险层升级：Hazard Bucket Fusion（P/A/Q/R），预警与体感协同避免重复扣分；新增 `ts` 支持 forecast 评估时刻；新增 `risk_hint` 与 `risk_focus`；输出 hazards 分桶明细与 factors 列表。 |
 
-> **当前版本：v3.1.1 – 南半球气候区修正**
+
+> **当前版本：v3.2.0 – 风险层升级**
 
 ---
 
