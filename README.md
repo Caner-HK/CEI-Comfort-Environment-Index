@@ -42,7 +42,7 @@ Since **v3.0.0**, CEI has been clearly separated into two independent yet compos
 
    Outputs a **0–100 Comfort CEI (`comfort_cei`)**.
 
-2. **Risk Layer** (v3.2.0)  
+2. **Risk Layer** (v3.2.0 update)  
    Measures “how dangerous the environment is,” and outputs **RiskCap** (a cap) to constrain the final CEI.
    This layer adopts **Hazard Bucket Fusion**:
 
@@ -503,6 +503,16 @@ This makes CEI suitable for:
 * Web front-ends and back-end APIs (SaaS, open platforms)
 * IoT / edge devices (weather stations, e-ink panels)
 * Data analytics and AI decision engines (travel advice, health risk assessment)
+
+### ✔ Future Plan: C Rewrite & SWIG Cross-Platform Adapters
+
+Once the CEI algorithm stabilizes, the core computation will be **rewritten in C** and wrapped via **SWIG (Simplified Wrapper and Interface Generator)** to provide native bindings:
+
+* **Performance gains** – C delivers higher throughput, ideal for embedded devices and high-frequency back-end calls
+* **Write once, reuse everywhere** – SWIG adapters expose the same C core to Python, JavaScript, Java, Ruby, C#, Go, and more
+* **Native speed + ecosystem ergonomics** – platforms call the same optimized C library while retaining each language’s tooling and developer workflow
+
+This roadmap turns CEI into a truly **cross-platform environment intelligence standard library**, preserving algorithmic consistency while delivering optimal performance across stacks.
 
 ---
 
